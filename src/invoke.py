@@ -660,7 +660,7 @@ def api_openapi():
             "/api/v1/balance": {"get": {"summary": "USDT balance", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/home": {"get": {"summary": "Home summary (balance, health, movement)", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/market/status": {"get": {"summary": "Market status (USDZAR + top symbols)", "responses": {"200": {"description": "OK"}}}},
-            "/api/v1/market/quote": {"get": {"summary": "Quote symbol in USDT and ZAR", "parameters": [{"name": "symbol", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "400": {"description": "Bad request"}}}},
+            "/api/v1/market/quote": {"get": {"summary": "Quote symbol in USDT and ZAR", "parameters": [{"name": "symbol", "in": "query", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "400": {"description": "Bad request"}}}},
             "/api/v1/status": {"get": {"summary": "Status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/metrics": {"get": {"summary": "Metrics", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/handshake/status": {"get": {"summary": "Background handshake status", "responses": {"200": {"description": "OK"}}}},
@@ -2082,19 +2082,15 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        # Start policy worker thread once
+        # Start policy/handshake/reconciler worker threads once
         if not _policy_thread_started and POLICY_ENABLED:
             t = threading.Thread(target=_policy_worker_loop, daemon=True)
             t.start()
             _policy_thread_started = True
-        # Start handshake worker
-        global _handshake_thread_started
         if HANDSHAKE_ENABLED and not _handshake_thread_started:
             th = threading.Thread(target=_handshake_worker_loop, daemon=True)
             th.start()
             _handshake_thread_started = True
-        # Start reconciler worker
-        global _reconcile_thread_started
         if not _reconcile_thread_started:
             tr = threading.Thread(target=_reconcile_worker_loop, daemon=True)
             tr.start()

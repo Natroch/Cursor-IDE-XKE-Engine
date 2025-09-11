@@ -80,7 +80,9 @@ if (-not $env:API_HMAC_SECRET) {
 
 Write-Info "Config"
 Write-Host ("  RPC_URL           : {0}" -f $env:RPC_URL)
-Write-Host ("  CONTRACT_ADDRESS  : {0}" -f ($env:CONTRACT_ADDRESS ?? "(not set)"))
+${contractAddressDisplay} = $env:CONTRACT_ADDRESS
+if (-not $contractAddressDisplay) { ${contractAddressDisplay} = "(not set)" }
+Write-Host ("  CONTRACT_ADDRESS  : {0}" -f ${contractAddressDisplay})
 Write-Host ("  USDT_ADDRESS      : {0}" -f $env:USDT_ADDRESS)
 Write-Host ("  USDT_DECIMALS     : {0}" -f $env:USDT_DECIMALS)
 Write-Host ("  PORT              : {0}" -f $env:PORT)
