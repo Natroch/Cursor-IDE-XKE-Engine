@@ -405,6 +405,23 @@ def _breaker_tripped() -> bool:
     return err_rate >= BREAKER_ERR_RATE
 
 
+# -------- Handshake & reconciliation config -------- #
+HANDSHAKE_URL = os.getenv("HANDSHAKE_URL", "")
+HANDSHAKE_ENABLED = (os.getenv("HANDSHAKE_ENABLED", "true").lower() in ["1","true","yes","y"]) if HANDSHAKE_URL else False
+HANDSHAKE_INTERVAL_SECONDS = int(os.getenv("HANDSHAKE_INTERVAL_SECONDS", "30"))
+
+CONFIRM_TARGET = int(os.getenv("CONFIRM_TARGET", "2"))
+
+_handshake_last_ts: Optional[float] = None
+_handshake_last_code: Optional[int] = None
+_handshake_last_error: Optional[str] = None
+_handshake_thread_started = False
+
+_reconcile_last_ts: Optional[float] = None
+_reconcile_last_checked: Optional[int] = None
+_reconcile_thread_started = False
+
+
 def _gas_price_gwei(rpc_url: Optional[str]) -> Optional[float]:
     try:
         if not rpc_url:
@@ -646,6 +663,8 @@ def api_openapi():
             "/api/v1/market/quote": {"get": {"summary": "Quote symbol in USDT and ZAR", "parameters": [{"name": "symbol", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "400": {"description": "Bad request"}}}},
             "/api/v1/status": {"get": {"summary": "Status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/metrics": {"get": {"summary": "Metrics", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/handshake/status": {"get": {"summary": "Background handshake status", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/reconcile/status": {"get": {"summary": "Payout reconciler status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reload": {"post": {"summary": "Reload env", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/quote": {"post": {"summary": "Quote payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/send": {"post": {"summary": "Send payout", "responses": {"200": {"description": "OK"}}}},
@@ -794,6 +813,54 @@ def _policy_worker_loop() -> None:
         except Exception:
             pass
         time.sleep(max(POLICY_INTERVAL_SECONDS, 60))
+
+
+def _handshake_worker_loop() -> None:
+    global _handshake_last_ts, _handshake_last_code, _handshake_last_error
+    while True:
+        try:
+            if HANDSHAKE_ENABLED and HANDSHAKE_URL:
+                try:
+                    r = requests.get(HANDSHAKE_URL, timeout=10)
+                    _handshake_last_code = r.status_code
+                    _handshake_last_error = None
+                except Exception as e:
+                    _handshake_last_code = None
+                    _handshake_last_error = str(e)
+                _handshake_last_ts = time.time()
+        except Exception:
+            pass
+        time.sleep(max(HANDSHAKE_INTERVAL_SECONDS, 10))
+
+
+def _reconcile_worker_loop() -> None:
+    global _reconcile_last_ts, _reconcile_last_checked
+    while True:
+        try:
+            _reconcile_last_ts = time.time()
+            if not DB_ENABLED:
+                time.sleep(10)
+                continue
+            rpc = RPC_URL or os.getenv("RPC_URL")
+            if not rpc:
+                time.sleep(10)
+                continue
+            session = SessionLocal()
+            try:
+                pending = session.query(Payout).filter(Payout.status == "SENT").all()
+                for row in pending:
+                    confs = _confirmations_for_tx(rpc, row.tx_id)
+                    if confs is not None:
+                        _reconcile_last_checked = int(confs)
+                        if int(confs) >= int(CONFIRM_TARGET):
+                            row.status = "CONFIRMED"
+                            row.updated_at = datetime.utcnow()
+                            session.commit()
+            finally:
+                session.close()
+        except Exception:
+            pass
+        time.sleep(12)
 
 
 @api_v1.route("/policy/status", methods=["GET"])
@@ -1077,6 +1144,17 @@ def api_metrics():
         "total_residual": totals.get("total_residual", 0.0),
         "pool_total": totals.get("pool_total", 0.0),
         "pending_residual_events": int(pending_count),
+        "handshake": {
+            "enabled": HANDSHAKE_ENABLED,
+            "last_ts": int(_handshake_last_ts) if _handshake_last_ts else None,
+            "last_code": _handshake_last_code,
+            "last_error": _handshake_last_error,
+        },
+        "reconciler": {
+            "last_ts": int(_reconcile_last_ts) if _reconcile_last_ts else None,
+            "last_checked": _reconcile_last_checked,
+            "confirm_target": CONFIRM_TARGET,
+        },
     })
 
 
@@ -1087,6 +1165,27 @@ def api_reload():
         return auth_failed
     res = _refresh_config_from_env()
     return jsonify(res), 200
+
+
+@api_v1.route("/handshake/status", methods=["GET"])
+def api_handshake_status():
+    return _json_ok({
+        "enabled": HANDSHAKE_ENABLED,
+        "url": HANDSHAKE_URL or None,
+        "last_ts": int(_handshake_last_ts) if _handshake_last_ts else None,
+        "last_code": _handshake_last_code,
+        "last_error": _handshake_last_error,
+        "interval_seconds": HANDSHAKE_INTERVAL_SECONDS,
+    })
+
+
+@api_v1.route("/reconcile/status", methods=["GET"])
+def api_reconcile_status():
+    return _json_ok({
+        "last_ts": int(_reconcile_last_ts) if _reconcile_last_ts else None,
+        "last_checked": _reconcile_last_checked,
+        "confirm_target": CONFIRM_TARGET,
+    })
 
 
 # ---------------- Market endpoints ---------------- #
@@ -1944,6 +2043,18 @@ if __name__ == "__main__":
             t = threading.Thread(target=_policy_worker_loop, daemon=True)
             t.start()
             _policy_thread_started = True
+        # Start handshake worker
+        global _handshake_thread_started
+        if HANDSHAKE_ENABLED and not _handshake_thread_started:
+            th = threading.Thread(target=_handshake_worker_loop, daemon=True)
+            th.start()
+            _handshake_thread_started = True
+        # Start reconciler worker
+        global _reconcile_thread_started
+        if not _reconcile_thread_started:
+            tr = threading.Thread(target=_reconcile_worker_loop, daemon=True)
+            tr.start()
+            _reconcile_thread_started = True
     except Exception:
         pass
     app.run(host="0.0.0.0", port=port)
