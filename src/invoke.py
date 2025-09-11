@@ -493,8 +493,9 @@ def api_balance():
 
 @api_v1.route("/openapi.json", methods=["GET"])
 def api_openapi():
-    # Minimal OpenAPI 3.1 for AI Studio consumption
-    spec = {
+    try:
+        # Minimal OpenAPI 3.1 for AI Studio consumption
+        spec = {
         "openapi": "3.1.0",
         "info": {"title": "XamKwe Echo API", "version": "1.0.0"},
         "paths": {
@@ -508,8 +509,167 @@ def api_openapi():
             "/api/v1/payout/send": {"post": {"summary": "Send payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/{id}": {"get": {"summary": "Get payout by id/key/tx", "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "404": {"description": "Not found"}}}},
         },
-    }
-    return jsonify(spec), 200
+        }
+        return jsonify(spec), 200
+    except Exception as exc:
+        return _json_err("openapi_build_failed", 500, detail=str(exc))
+
+
+############################
+# Policy scheduler (standardized payouts)
+############################
+
+# Policy configuration (AI Studio payout tab)
+POLICY_ENABLED = (os.getenv("POLICY_ENABLED", "true").lower() in ["1","true","yes","y"])
+POLICY_POOL_TRIGGER_USDT = float(os.getenv("POLICY_POOL_TRIGGER_USDT", "5000"))
+POLICY_TARGET_POOL_USDT = float(os.getenv("POLICY_TARGET_POOL_USDT", "100000"))
+POLICY_LUNO_RECIPIENT = os.getenv("POLICY_LUNO_RECIPIENT", "")
+POLICY_MM_RECIPIENT = os.getenv("POLICY_MM_RECIPIENT", "")
+POLICY_LUNO_AMOUNT_USDT = float(os.getenv("POLICY_LUNO_AMOUNT_USDT", "1000"))
+POLICY_MM_AMOUNT_USDT = float(os.getenv("POLICY_MM_AMOUNT_USDT", "100"))
+POLICY_INTERVAL_SECONDS = int(os.getenv("POLICY_INTERVAL_SECONDS", "300"))
+
+_policy_last_run_ts: Optional[float] = None
+_policy_last_action: Optional[str] = None
+_policy_thread_started = False
+
+
+def _policy_should_run() -> bool:
+    if not DB_ENABLED or not POLICY_ENABLED:
+        return False
+    # Avoid too-frequent runs
+    if _policy_last_run_ts and (time.time() - _policy_last_run_ts) < max(POLICY_INTERVAL_SECONDS, 60):
+        return False
+    return True
+
+
+def _policy_tick() -> None:
+    global _policy_last_run_ts, _policy_last_action
+    _policy_last_run_ts = time.time()
+    _policy_last_action = None
+
+    # Safety checks
+    if _breaker_tripped():
+        _policy_last_action = "breaker_open"
+        return
+    g = _gas_price_gwei(RPC_URL)
+    if g is not None and g > MAX_GAS_GWEI:
+        _policy_last_action = f"gas_high_{g:.2f}gwei"
+        return
+
+    # Compute totals
+    totals = _compute_echo_totals()
+    pool_total = float(totals.get("pool_total", 0.0) or 0.0)
+    # Stop policy after reaching target pool
+    if pool_total >= POLICY_TARGET_POOL_USDT:
+        _policy_last_action = "target_reached"
+        return
+    if pool_total < POLICY_POOL_TRIGGER_USDT:
+        _policy_last_action = "below_trigger"
+        return
+
+    # Prepare recipients
+    runs: list[tuple[str, float, str]] = []
+    if POLICY_LUNO_RECIPIENT:
+        runs.append((POLICY_LUNO_RECIPIENT, POLICY_LUNO_AMOUNT_USDT, "POLICY-LUNO"))
+    if POLICY_MM_RECIPIENT:
+        runs.append((POLICY_MM_RECIPIENT, POLICY_MM_AMOUNT_USDT, "POLICY-MM"))
+    if not runs:
+        _policy_last_action = "no_recipients"
+        return
+
+    session = SessionLocal() if DB_ENABLED else None
+    try:
+        for recipient, amount_usdt, tag in runs:
+            # Canary checks
+            fail = _enforce_canary(session, recipient, amount_usdt) if session else None
+            if fail is not None:
+                _policy_last_action = f"canary_block_{tag}"
+                continue
+
+            amount_units = int(round(float(amount_usdt) * (10 ** USDT_DECIMALS)))
+            idem_key = f"policy-{tag}-{time.strftime('%Y%m%d')}-{recipient.lower()}-{amount_units}"
+
+            # Idempotency
+            if DB_ENABLED:
+                existing = session.query(Payout).filter(Payout.idem_key == idem_key).first()
+                if existing and existing.status in ("SENT", "CONFIRMED"):
+                    _policy_last_action = f"already_sent_{tag}"
+                    continue
+
+            # Record REQUESTED
+            if DB_ENABLED:
+                row = Payout(
+                    idem_key=idem_key,
+                    recipient=recipient,
+                    echo_tag=tag,
+                    amount_usdt=amount_usdt,
+                    amount_units=amount_units,
+                    status="REQUESTED",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+                session.add(row)
+                session.commit()
+
+            # Send
+            tx = send_payout_onchain(recipient, amount_units, tag)
+            ok = bool(tx)
+            _record_error_event(ok)
+            if DB_ENABLED:
+                row = session.query(Payout).filter(Payout.idem_key == idem_key).first()
+                if row:
+                    row.status = "SENT" if ok else "FAILED"
+                    row.tx_id = tx
+                    row.updated_at = datetime.utcnow()
+                    session.commit()
+
+            # Confirm (non-blocking small wait)
+            confirmed = False
+            if tx:
+                try:
+                    confirmed = confirm_onchain(tx, int(os.getenv("CONFIRM_TIMEOUT", "60")))
+                except Exception:
+                    confirmed = False
+            if DB_ENABLED:
+                row = session.query(Payout).filter(Payout.idem_key == idem_key).first()
+                if row:
+                    row.status = "CONFIRMED" if confirmed else row.status
+                    row.updated_at = datetime.utcnow()
+                    session.commit()
+
+            _policy_last_action = (f"sent_{tag}" if ok else f"failed_{tag}")
+    finally:
+        if session:
+            session.close()
+
+
+def _policy_worker_loop() -> None:
+    while True:
+        try:
+            if _policy_should_run():
+                _policy_tick()
+        except Exception:
+            pass
+        time.sleep(max(POLICY_INTERVAL_SECONDS, 60))
+
+
+@api_v1.route("/policy/status", methods=["GET"])
+def api_policy_status():
+    totals = _compute_echo_totals()
+    return _json_ok({
+        "enabled": POLICY_ENABLED,
+        "trigger_usdt": POLICY_POOL_TRIGGER_USDT,
+        "target_pool_usdt": POLICY_TARGET_POOL_USDT,
+        "luno_amount_usdt": POLICY_LUNO_AMOUNT_USDT,
+        "mm_amount_usdt": POLICY_MM_AMOUNT_USDT,
+        "luno_recipient": POLICY_LUNO_RECIPIENT or None,
+        "mm_recipient": POLICY_MM_RECIPIENT or None,
+        "pool_total": totals.get("pool_total", 0.0),
+        "last_run_ts": int(_policy_last_run_ts) if _policy_last_run_ts else None,
+        "last_action": _policy_last_action,
+        "interval_seconds": POLICY_INTERVAL_SECONDS,
+    })
 
 
 @api_v1.route("/status", methods=["GET"])
@@ -1325,13 +1485,35 @@ def send_payout_onchain(recipient: str, amount_units: int, echo_tag: str) -> Opt
 
 
 def confirm_onchain(tx_hash: str, timeout_seconds: int = 180) -> bool:
-    if not w3:
-        return False
+    # Prefer web3 if available
+    if w3 and Web3 is not None:
+        try:
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_seconds)
+            return getattr(receipt, "status", 0) == 1
+        except Exception as exc:
+            print(f"⚠️ Web3 confirmation failed, falling back to RPC: {exc}")
+
+    # Fallback to raw RPC
     try:
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_seconds)
-        return getattr(receipt, "status", 0) == 1
-    except Exception as exc:
-        print(f"❌ Waiting for tx confirmation failed: {exc}")
+        rpc = RPC_URL or os.getenv("RPC_URL")
+        if not rpc:
+            return False
+        # poll every 3s up to timeout_seconds
+        deadline = time.time() + max(int(timeout_seconds), 1)
+        while time.time() < deadline:
+            body = {"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[tx_hash]}
+            r = requests.post(rpc, json=body, timeout=15)
+            r.raise_for_status()
+            res = (r.json() or {}).get("result")
+            if isinstance(res, dict) and "status" in res:
+                try:
+                    return int(res.get("status") or "0x0", 16) == 1
+                except Exception:
+                    return False
+            time.sleep(3)
+        return False
+    except Exception as exc2:
+        print(f"❌ RPC confirmation failed: {exc2}")
         return False
 
 
@@ -1562,18 +1744,24 @@ if __name__ == "__main__":
         pass
     try:
         # Enable basic CORS for AI Studio/testing
-        from flask import make_response
-
         @app.after_request
         def add_cors_headers(resp):  # type: ignore
             try:
                 allow_origin = os.getenv("CORS_ORIGIN", "*")
                 resp.headers["Access-Control-Allow-Origin"] = allow_origin
-                resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Idempotency-Key, X-Client-Id, X-XKE-Timestamp, X-XKE-Signature"
+                resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Idempotency-Key, X-Client-Id, X-XKE-Timestamp, X-XKE-Signature, Authorization"
                 resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             except Exception:
                 pass
             return resp
+    except Exception:
+        pass
+    try:
+        # Start policy worker thread once
+        if not _policy_thread_started and POLICY_ENABLED:
+            t = threading.Thread(target=_policy_worker_loop, daemon=True)
+            t.start()
+            _policy_thread_started = True
     except Exception:
         pass
     app.run(host="0.0.0.0", port=port)
