@@ -254,6 +254,52 @@ def _rpc_eth_call(rpc_url: str, to: str, data: str) -> Optional[str]:
     return None
 
 
+def _rpc_json(rpc_url: str, method: str, params: list) -> Optional[dict]:
+    try:
+        body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        r = requests.post(rpc_url, json=body, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _rpc_block_number(rpc_url: str) -> Optional[int]:
+    j = _rpc_json(rpc_url, "eth_blockNumber", [])
+    try:
+        if j and isinstance(j.get("result"), str):
+            return int(j["result"], 16)
+    except Exception:
+        return None
+    return None
+
+
+def _rpc_tx_receipt(rpc_url: str, tx_hash: str) -> Optional[dict]:
+    j = _rpc_json(rpc_url, "eth_getTransactionReceipt", [tx_hash])
+    try:
+        res = j.get("result") if j else None
+        return res if isinstance(res, dict) else None
+    except Exception:
+        return None
+
+
+def _confirmations_for_tx(rpc_url: Optional[str], tx_hash: Optional[str]) -> Optional[int]:
+    try:
+        if not rpc_url or not tx_hash:
+            return None
+        receipt = _rpc_tx_receipt(rpc_url, tx_hash)
+        if not receipt or not receipt.get("blockNumber"):
+            return 0
+        tx_block = int(str(receipt["blockNumber"]), 16)
+        head = _rpc_block_number(rpc_url)
+        if head is None:
+            return None
+        # confirmations = head - tx_block + 1 (at least 1 when mined)
+        return max((head - tx_block + 1), 0)
+    except Exception:
+        return None
+
+
 def _read_decimals_via_rpc(rpc_url: str, token: str) -> Optional[int]:
     out = _rpc_eth_call(rpc_url, token, "0x313ce567")
     if not out:
@@ -498,6 +544,48 @@ def api_config():
     return _json_ok(safe)
 
 
+@api_v1.route("/home", methods=["GET"])
+def api_home():
+    # Summary for frontend home page
+    bal = _read_usdt_balance_human()
+    usd_zar = _fx_usd_zar()
+    # Treat USDT≈USD for estimate
+    est_usdt_value = round(float(bal or 0.0), 6)
+    est_zar_value = round(est_usdt_value * float(usd_zar or 0.0), 2)
+    health = {
+        "ok": True,
+        "db": bool(DB_ENABLED),
+        "rpc": bool(RPC_URL),
+        "chain_id": CHAIN_ID,
+        "gas_gwei": _gas_price_gwei(RPC_URL),
+        "breaker": _breaker_tripped(),
+    }
+    # movement rate proxy: pending residuals + last timestamp recency
+    last = _read_last_echo_info()
+    totals = _compute_echo_totals()
+    pending = 0
+    if DB_ENABLED:
+        try:
+            s = SessionLocal()
+            try:
+                pending = s.execute("SELECT COUNT(1) FROM residual_events WHERE status='pending'").scalar() or 0
+            finally:
+                s.close()
+        except Exception:
+            pending = 0
+    return _json_ok({
+        "usdt_balance": (round(bal, 6) if isinstance(bal, float) else None),
+        "usdt_value": est_usdt_value,
+        "zar_value": est_zar_value,
+        "usd_zar": (round(float(usd_zar), 4) if usd_zar else None),
+        "health": health,
+        "movement_pending": int(pending),
+        "last_timestamp": last.get("timestamp"),
+        "pool_total": totals.get("pool_total", 0.0),
+        "server_time": int(time.time()),
+    })
+
+
 @api_v1.route("/balance", methods=["GET"])
 def api_balance():
     if _is_mock_mode():
@@ -553,6 +641,7 @@ def api_openapi():
             "/api/v1/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/config": {"get": {"summary": "Config", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/balance": {"get": {"summary": "USDT balance", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/home": {"get": {"summary": "Home summary (balance, health, movement)", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/market/status": {"get": {"summary": "Market status (USDZAR + top symbols)", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/market/quote": {"get": {"summary": "Quote symbol in USDT and ZAR", "parameters": [{"name": "symbol", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "400": {"description": "Bad request"}}}},
             "/api/v1/status": {"get": {"summary": "Status", "responses": {"200": {"description": "OK"}}}},
@@ -954,6 +1043,8 @@ def api_payout_get(pid: str):
             "amount_usdt": row.amount_usdt,
             "status": row.status,
             "tx_id": row.tx_id,
+            "confirmations": _confirmations_for_tx(RPC_URL, row.tx_id),
+            "contract": CONTRACT_ADDRESS,
             "created_at": (row.created_at.isoformat() if row.created_at else None),
             "updated_at": (row.updated_at.isoformat() if row.updated_at else None),
         })
