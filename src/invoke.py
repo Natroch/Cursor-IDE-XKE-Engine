@@ -666,6 +666,7 @@ def api_openapi():
             "/api/v1/handshake/status": {"get": {"summary": "Background handshake status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reconcile/status": {"get": {"summary": "Payout reconciler status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reload": {"post": {"summary": "Reload env", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/flow/status": {"get": {"summary": "Pipeline status: Harvested→Validated→Aggregated→Payout→Proof", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/quote": {"post": {"summary": "Quote payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/send": {"post": {"summary": "Send payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/{id}": {"get": {"summary": "Get payout by id/key/tx", "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "404": {"description": "Not found"}}}},
@@ -1165,6 +1166,49 @@ def api_reload():
         return auth_failed
     res = _refresh_config_from_env()
     return jsonify(res), 200
+
+
+@api_v1.route("/flow/status", methods=["GET"])
+def api_flow_status():
+    harvested = 0
+    validated = 0
+    aggregated_usdt = 0.0
+    payout_triggered = 0
+    onchain_proof = 0
+    latest_ts = None
+    if DB_ENABLED:
+        try:
+            s = SessionLocal()
+            try:
+                # Residual events as harvested/validated (simple proxy)
+                h = s.execute("SELECT COUNT(1) FROM residual_events WHERE status='pending'").scalar() or 0
+                v = s.execute("SELECT COUNT(1) FROM residual_events WHERE status='confirmed'").scalar() or 0
+                # Aggregated pool total
+                adds = s.query(PoolEvent).filter(PoolEvent.kind == "add").all()
+                subs = s.query(PoolEvent).filter(PoolEvent.kind == "withdraw").all()
+                aggregated_usdt = float(sum(float(e.amount or 0.0) for e in adds) - sum(float(e.amount or 0.0) for e in subs))
+                # Payouts
+                payout_triggered = s.execute("SELECT COUNT(1) FROM payouts WHERE status='SENT'").scalar() or 0
+                onchain_proof = s.execute("SELECT COUNT(1) FROM payouts WHERE status='CONFIRMED'").scalar() or 0
+                # Latest timestamp across ledgers (as activity marker)
+                last = (
+                    s.query(LedgerEntry)
+                    .order_by(LedgerEntry.timestamp.desc())
+                    .first()
+                )
+                latest_ts = last.timestamp.isoformat() if last and last.timestamp else None
+            finally:
+                s.close()
+        except Exception:
+            pass
+    return _json_ok({
+        "harvested": int(harvested),
+        "validated": int(validated),
+        "aggregated_usdt": round(float(aggregated_usdt), 6),
+        "payout_triggered": int(payout_triggered),
+        "onchain_proof": int(onchain_proof),
+        "last_activity": latest_ts,
+    })
 
 
 @api_v1.route("/handshake/status", methods=["GET"])
