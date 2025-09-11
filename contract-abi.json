@@ -1,0 +1,12 @@
+[
+  {
+    "name": "recoverEcho",
+    "type": "function",
+    "stateMutability": "nonpayable",
+    "inputs": [
+      {"name":"recipient","type":"address"},
+      {"name":"amount","type":"uint256"}
+    ],
+    "outputs": []
+  }
+]

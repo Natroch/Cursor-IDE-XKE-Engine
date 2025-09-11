@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XKE Echo Recovery</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .card { max-width: 780px; padding: 16px; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 16px; }
+      .row { display: flex; gap: 12px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+      label { min-width: 120px; font-weight: 600; }
+      input { padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 6px; min-width: 260px; }
+      button { padding: 10px 14px; border: 0; background: #2563eb; color: #fff; border-radius: 6px; cursor: pointer; }
+      button.secondary { background: #6b7280; }
+      .muted { color: #6b7280; }
+      .ok { color: #16a34a; }
+      .warn { color: #b45309; }
+      .err { color: #dc2626; }
+      .right { text-align: right; }
+      code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/ethers@6.13.2/dist/ethers.umd.min.js"></script>
+    <!-- Optional: set your deployed contract here to avoid console setup -->
+    <!-- <script>window.CONTRACT_ADDRESS = "0xPASTE_DEPLOYED_CONTRACT";</script> -->
+  </head>
+  <body>
+    <h2>XamKwe Echo Recovery</h2>
+    <div class="card">
+      <div class="row">
+        <button id="btnConnect">Connect Wallet</button>
+        <div id="connStatus" class="muted">Not connected</div>
+      </div>
+      <div class="row"><label>Connected:</label><div id="addr" class="muted">-</div></div>
+      <div class="row"><label>Chain ID:</label><div id="chain" class="muted">-</div></div>
+      <div class="row"><label>Owner:</label><div id="owner" class="muted">-</div></div>
+      <div class="row"><label>Contract:</label><div id="contract" class="muted">-</div></div>
+      <div class="row"><label>USDT Balance:</label><div id="bal" class="muted">-</div><button id="btnRefresh" class="secondary">Refresh</button></div>
+    </div>
+
+    <div class="card">
+      <h3>Recover Echo → USDT payout</h3>
+      <div class="row"><label>Recipient</label><input id="recipient" placeholder="0x..." /></div>
+      <div class="row"><label>Amount (USDT)</label><input id="amount" placeholder="e.g. 10.00" /></div>
+      <div class="row">
+        <button id="btnRecover">Send recoverEcho</button>
+        <div id="txStatus" class="muted">-</div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+ </html>
+"C:\Users\Administrator\Downloads\xamkwe-echo-engine-main\xamkwe-echo-engine-main\web\index.html"
+<script>window.CONTRACT_ADDRESS="0xdAC17F958D2ee523a2206206994597C13D831ec7";</script>
+

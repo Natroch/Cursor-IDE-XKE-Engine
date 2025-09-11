@@ -1,0 +1,11 @@
+Flask==3.0.2
+SQLAlchemy==2.0.30
+psycopg2-binary==2.9.9
+requests==2.32.3
+web3==6.11.0
+eth-account==0.11.3
+python-dotenv==1.0.1
+pydantic==2.8.2
+tenacity==8.2.3
+py-solc-x==1.1.1
+websocket-client==1.7.0

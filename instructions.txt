@@ -1,0 +1,3 @@
+Use Home.tsx or Dashboard.tsx as your entry point.
+
+modularize logic into hooks and services for clean separation
