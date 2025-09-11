@@ -399,6 +399,57 @@ def _enforce_canary(session, recipient: str, amount_usdt: float) -> Optional[Res
 
 api_v1 = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 
+# --------------- Market helpers (24/7 international/crypto) --------------- #
+BINANCE_ENABLE = (os.getenv("BINANCE_ENABLE", "true").lower() in ["1","true","yes","y"])
+BINANCE_SYMBOLS = [s.strip().upper() for s in (os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(",")) if s.strip()]
+FX_USD_ZAR_URL = os.getenv("FX_USD_ZAR_URL", "https://api.exchangerate.host/latest?base=USD&symbols=ZAR")
+
+
+def _fetch_json(url: str, timeout: int = 10) -> Optional[dict]:
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, dict) or isinstance(j, list):
+            return j  # type: ignore
+    except Exception:
+        return None
+    return None
+
+
+def _binance_price(symbol: str) -> Optional[float]:
+    try:
+        if not BINANCE_ENABLE:
+            return None
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+        j = _fetch_json(url)
+        if isinstance(j, dict) and "price" in j:
+            return float(j["price"])  # price in quote currency (e.g., USDT)
+    except Exception:
+        return None
+    return None
+
+
+def _binance_prices(symbols: list[str]) -> dict:
+    out: dict[str, Optional[float]] = {}
+    for s in symbols:
+        out[s.upper()] = _binance_price(s)
+    return out
+
+
+def _fx_usd_zar() -> Optional[float]:
+    try:
+        j = _fetch_json(FX_USD_ZAR_URL)
+        if isinstance(j, dict):
+            # exchangerate.host format
+            rates = j.get("rates") or {}
+            val = rates.get("ZAR")
+            if val is not None:
+                return float(val)
+    except Exception:
+        return None
+    return None
+
 
 @api_v1.app_errorhandler(Exception)
 def _api_error(exc):  # type: ignore
@@ -502,6 +553,8 @@ def api_openapi():
             "/api/v1/health": {"get": {"summary": "Health", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/config": {"get": {"summary": "Config", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/balance": {"get": {"summary": "USDT balance", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/market/status": {"get": {"summary": "Market status (USDZAR + top symbols)", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/market/quote": {"get": {"summary": "Quote symbol in USDT and ZAR", "parameters": [{"name": "symbol", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "400": {"description": "Bad request"}}}},
             "/api/v1/status": {"get": {"summary": "Status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/metrics": {"get": {"summary": "Metrics", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reload": {"post": {"summary": "Reload env", "responses": {"200": {"description": "OK"}}}},
@@ -943,6 +996,44 @@ def api_reload():
         return auth_failed
     res = _refresh_config_from_env()
     return jsonify(res), 200
+
+
+# ---------------- Market endpoints ---------------- #
+@api_v1.route("/market/status", methods=["GET"])
+def api_market_status():
+    try:
+        prices = _binance_prices(BINANCE_SYMBOLS)
+        usd_zar = _fx_usd_zar()
+        return _json_ok({
+            "binance_enable": BINANCE_ENABLE,
+            "symbols": BINANCE_SYMBOLS,
+            "prices_usdt": prices,
+            "usd_zar": (round(usd_zar, 4) if isinstance(usd_zar, float) else None),
+            "server_time": int(time.time()),
+        })
+    except Exception as exc:
+        return _json_err("market_unavailable", 503, detail=str(exc))
+
+
+@api_v1.route("/market/quote", methods=["GET"])
+def api_market_quote():
+    symbol = (request.args.get("symbol") or "").strip().upper()
+    if not symbol:
+        return _json_err("missing_symbol", 400)
+    p = _binance_price(symbol)
+    if p is None:
+        return _json_err("symbol_unavailable", 404)
+    usd_zar = _fx_usd_zar() or 0.0
+    # p is price in USDT, treat USDT≈USD for quoting
+    price_usdt = float(p)
+    price_zar = float(price_usdt) * float(usd_zar)
+    return _json_ok({
+        "symbol": symbol,
+        "price_usdt": round(price_usdt, 6),
+        "price_zar": round(price_zar, 2),
+        "usd_zar": round(float(usd_zar), 4) if usd_zar else None,
+        "ts": int(time.time()),
+    })
 
 @app.route("/health")
 def health():
