@@ -209,3 +209,9 @@ pk.txt
 .venv/
 *.pyc
 .DS_Store
+.env
+pk.txt
+.venv/
+__pycache__/
+*.pyc
+*.log
