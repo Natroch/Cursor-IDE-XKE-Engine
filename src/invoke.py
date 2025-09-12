@@ -20,6 +20,7 @@ try:
         Float,
         Integer,
         String,
+        Text,
         create_engine,
     )
     from sqlalchemy.orm import declarative_base, sessionmaker
@@ -106,6 +107,128 @@ if DB_ENABLED:
         created_at = Column(DateTime)
         updated_at = Column(DateTime)
 
+    # -------------- New trace-ledger and anchoring models -------------- #
+    class IngestEvent(Base):
+        __tablename__ = "ingest_events"
+        id = Column(Integer, primary_key=True)
+        source = Column(String)              # e.g., 'swift', 'visa', 'marine_traffic', 'coingecko'
+        event_type = Column(String)          # free-form type/name
+        external_id = Column(String)         # upstream id/hash if present
+        trace_id = Column(String, index=True)  # link events across domains
+        amount = Column(Float)
+        currency = Column(String)
+        amount_usd = Column(Float)           # converted snapshot
+        fx_rate_to_usd = Column(Float)       # FX used
+        geo = Column(String)                 # optional geo/loc code
+        merchant = Column(String)
+        merchant_lang = Column(String)
+        mcc = Column(String)
+        country_from = Column(String)
+        country_to = Column(String)
+        is_cross_border = Column(String)     # 'Y' or 'N' for SQLite simplicity
+        source_tz = Column(String)
+        status = Column(String)              # 'received'|'processed'|'error'
+        received_at = Column(DateTime)
+        raw_json = Column(Text)              # original payload for audit
+
+        def as_public(self) -> dict:
+            # Derive amount/currency at read time if missing, using saved raw_json
+            derived_amount = self.amount
+            derived_currency = self.currency
+            if (derived_amount is None or derived_currency is None) and self.raw_json:
+                try:
+                    raw = json.loads(self.raw_json)
+                    if isinstance(raw, dict):
+                        # Top-level fallbacks
+                        if derived_amount is None:
+                            for key in ["amount", "amount_total", "value", "gross_amount", "payment_amount"]:
+                                v = raw.get(key)
+                                if isinstance(v, (int, float)):
+                                    derived_amount = float(v)
+                                    break
+                                if isinstance(v, str) and v.strip() != "":
+                                    try:
+                                        derived_amount = float(v)
+                                        break
+                                    except Exception:
+                                        pass
+                        if derived_currency is None:
+                            for key in ["currency", "currency_code", "ccy"]:
+                                v = raw.get(key)
+                                if isinstance(v, str) and v.strip() != "":
+                                    derived_currency = v
+                                    break
+                        # PayPal-style nested resource.amount
+                        if (derived_amount is None or derived_currency is None) and isinstance(raw.get("resource"), dict):
+                            ra = raw["resource"].get("amount")
+                            if isinstance(ra, dict):
+                                if derived_amount is None:
+                                    total = ra.get("total") or ra.get("value")
+                                    if isinstance(total, (int, float)):
+                                        derived_amount = float(total)
+                                    elif isinstance(total, str) and total.strip() != "":
+                                        try:
+                                            derived_amount = float(total)
+                                        except Exception:
+                                            pass
+                                if derived_currency is None:
+                                    ccy = ra.get("currency") or ra.get("currency_code")
+                                    if isinstance(ccy, str) and ccy.strip() != "":
+                                        derived_currency = ccy
+                except Exception:
+                    pass
+            return {
+                "id": self.id,
+                "source": self.source,
+                "event_type": self.event_type,
+                "external_id": self.external_id,
+                "trace_id": self.trace_id,
+                "amount": derived_amount,
+                "currency": derived_currency,
+                "amount_usd": self.amount_usd,
+                "fx_rate_to_usd": self.fx_rate_to_usd,
+                "mcc": self.mcc,
+                "merchant": self.merchant,
+                "country_from": self.country_from,
+                "country_to": self.country_to,
+                "is_cross_border": self.is_cross_border,
+                "geo": self.geo,
+                "status": self.status,
+                "received_at": (self.received_at.isoformat() if self.received_at else None),
+            }
+
+    class TraceEdge(Base):
+        __tablename__ = "trace_edges"
+        id = Column(Integer, primary_key=True)
+        trace_id = Column(String, index=True)
+        from_event_id = Column(Integer)      # FK to IngestEvent.id (not enforced in SQLite)
+        to_event_id = Column(Integer)
+        relation = Column(String)            # e.g., 'follows', 'settles', 'ships'
+        created_at = Column(DateTime)
+
+    class Residual(Base):
+        __tablename__ = "residuals"
+        id = Column(Integer, primary_key=True)
+        trace_id = Column(String, index=True)
+        source_event_id = Column(Integer)    # originating IngestEvent.id
+        kind = Column(String)                # rounding|fee_rebate|dust|interest|mismatch
+        amount_usdt = Column(Float)
+        currency = Column(String)
+        credited_pool_event_id = Column(Integer)  # PoolEvent.id when credited
+        detected_at = Column(DateTime)
+        status = Column(String)              # 'pending'|'credited'|'cancelled'
+
+    class AnchorRecord(Base):
+        __tablename__ = "anchor_records"
+        id = Column(Integer, primary_key=True)
+        anchor_hash = Column(String, index=True)  # hash of off-chain window/ledger
+        chain_id = Column(Integer)
+        tx_id = Column(String)
+        confirmations = Column(Integer)
+        status = Column(String)              # 'queued'|'sent'|'confirmed'|'failed'
+        created_at = Column(DateTime)
+        anchored_at = Column(DateTime)
+
     Base.metadata.create_all(engine)
 else:
     # Minimal shims so the rest of the module can import without DB
@@ -122,6 +245,315 @@ def _get_account_address() -> Optional[str]:
     except Exception:
         return None
 
+
+############################
+# Etherscan micro-transfer harvester
+############################
+
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+ETHERSCAN_POLL_INTERVAL = int(os.getenv("ETHERSCAN_POLL_INTERVAL", "30"))
+RESIDUAL_MICRO_THRESHOLD_USDT = float(os.getenv("RESIDUAL_MICRO_THRESHOLD_USDT", "0.5"))
+ETHERSCAN_ENABLED = (os.getenv("ETHERSCAN_ENABLED", "true").lower() in ["1","true","yes","y"]) and bool(ETHERSCAN_API_KEY)
+
+_etherscan_thread_started = False
+_etherscan_last_ts: Optional[float] = None
+_etherscan_last_error: Optional[str] = None
+_etherscan_last_found: Optional[int] = None
+_etherscan_last_fromblock: Optional[int] = None
+
+
+def _rpc_block_number() -> Optional[int]:
+    try:
+        j = _rpc_json(RPC_URL, "eth_blockNumber", []) if RPC_URL else None
+        if j and isinstance(j.get("result"), str):
+            return int(j["result"], 16)
+    except Exception:
+        return None
+    return None
+
+
+############################
+# BTC mempool dust harvester (polling)
+############################
+
+MEMPOOL_ENABLED = (os.getenv("MEMPOOL_ENABLED", "true").lower() in ["1","true","yes","y"])
+MEMPOOL_POLL_INTERVAL = int(os.getenv("MEMPOOL_POLL_INTERVAL", "30"))
+BTC_DUST_THRESHOLD_SATS = int(os.getenv("BTC_DUST_THRESHOLD_SATS", "546"))
+
+_mempool_thread_started = False
+_mempool_last_ts: Optional[float] = None
+_mempool_last_error: Optional[str] = None
+_mempool_last_found: Optional[int] = None
+
+
+def _mempool_recent_txids(limit: int = 25) -> Optional[list[str]]:
+    try:
+        j = _fetch_json("https://mempool.space/api/mempool/recent")
+        if isinstance(j, list):
+            # recent list items include txid under key 'txid'
+            out: list[str] = []
+            for item in j[: max(min(limit, 50), 1)]:
+                try:
+                    txid = item.get("txid") if isinstance(item, dict) else None
+                    if isinstance(txid, str) and len(txid) == 64:
+                        out.append(txid)
+                except Exception:
+                    continue
+            return out
+    except Exception:
+        return None
+    return None
+
+
+def _mempool_tx(txid: str) -> Optional[dict]:
+    try:
+        j = _fetch_json(f"https://mempool.space/api/tx/{txid}")
+        if isinstance(j, dict):
+            return j
+    except Exception:
+        return None
+    return None
+
+
+def _sats_to_btc(sats: int) -> float:
+    try:
+        return float(sats) / 1e8
+    except Exception:
+        return 0.0
+
+
+def _mempool_worker_loop():
+    global _mempool_last_ts, _mempool_last_error, _mempool_last_found
+    while True:
+        try:
+            _mempool_last_ts = time.time()
+            _mempool_last_error = None
+            _mempool_last_found = 0
+            txids = _mempool_recent_txids(limit=20) or []
+            if not DB_ENABLED or not txids:
+                time.sleep(max(MEMPOOL_POLL_INTERVAL, 10))
+                continue
+            # price for conversion
+            btc_usdt = _binance_price("BTCUSDT") or 0.0
+            s = SessionLocal()
+            found = 0
+            try:
+                for txid in txids:
+                    try:
+                        # dedupe by external_id
+                        exists = s.query(IngestEvent).filter(
+                            IngestEvent.source == "mempool",
+                            IngestEvent.external_id == txid,
+                        ).first()
+                        if exists:
+                            continue
+                        tx = _mempool_tx(txid)
+                        if not isinstance(tx, dict):
+                            continue
+                        vout = tx.get("vout") or []
+                        # Some mempool.space responses structure use outputs under 'vout' with 'value' in sats
+                        dust_usdt_total = 0.0
+                        for o in vout:
+                            try:
+                                sats = o.get("value")
+                                if isinstance(sats, int) and sats > 0 and sats <= BTC_DUST_THRESHOLD_SATS:
+                                    btc_amt = _sats_to_btc(sats)
+                                    if btc_usdt and btc_amt > 0:
+                                        dust_usdt_total += (btc_amt * btc_usdt)
+                            except Exception:
+                                continue
+                        if dust_usdt_total > 0.0:
+                            now = datetime.utcnow()
+                            ie = IngestEvent(
+                                source="mempool",
+                                event_type="poll",
+                                external_id=txid,
+                                trace_id=txid,
+                                amount=float(dust_usdt_total),
+                                currency="USDT",
+                                amount_usd=float(dust_usdt_total),
+                                fx_rate_to_usd=1.0,
+                                geo=None,
+                                merchant=None,
+                                merchant_lang=None,
+                                mcc=None,
+                                country_from=None,
+                                country_to=None,
+                                is_cross_border="N",
+                                source_tz=None,
+                                status="received",
+                                received_at=now,
+                                raw_json=json.dumps(tx)[:200000],
+                            )
+                            s.add(ie)
+                            pe = PoolEvent(kind="add", amount=float(dust_usdt_total), currency="USDT", note=f"btc_dust {txid}", timestamp=now)
+                            s.add(pe)
+                            found += 1
+                    except Exception:
+                        continue
+                s.commit()
+                _mempool_last_found = found
+            finally:
+                s.close()
+        except Exception as e:
+            _mempool_last_error = str(e)
+        time.sleep(max(MEMPOOL_POLL_INTERVAL, 15))
+
+
+@app.route("/api/v1/mempool/status", methods=["GET"])
+def api_mempool_status():
+    return _json_ok({
+        "enabled": bool(MEMPOOL_ENABLED),
+        "last_ts": int(_mempool_last_ts or 0),
+        "last_error": _mempool_last_error,
+        "last_found": int(_mempool_last_found or 0),
+        "interval_sec": MEMPOOL_POLL_INTERVAL,
+        "dust_sats": BTC_DUST_THRESHOLD_SATS,
+    })
+
+# Direct route alias to avoid 404 if blueprint mounting is delayed
+@app.route("/api/v1/mempool/status", methods=["GET"])
+def api_mempool_status_alias():  # type: ignore
+    return api_mempool_status()
+
+def _etherscan_getlogs(from_block: int, to_block: Optional[int]) -> Optional[list]:
+    try:
+        usdt = os.getenv("USDT_ADDRESS")
+        if not usdt:
+            return []
+        base = "https://api.etherscan.io/api"
+        params = {
+            "module": "logs",
+            "action": "getLogs",
+            "fromBlock": str(from_block),
+            "toBlock": (str(to_block) if to_block is not None else "latest"),
+            "address": usdt,
+            # keccak256("Transfer(address,address,uint256)")
+            "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+            "apikey": ETHERSCAN_API_KEY,
+        }
+        r = requests.get(base, params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        if isinstance(j, dict) and j.get("status") in ("1", 1) and isinstance(j.get("result"), list):
+            return j["result"]
+        # status "0" with result [] means no logs
+        if isinstance(j, dict) and isinstance(j.get("result"), list):
+            return j["result"]
+    except Exception as e:
+        pass
+    return None
+
+
+def _decode_topic_address(topic_hex: str) -> Optional[str]:
+    try:
+        if isinstance(topic_hex, str) and topic_hex.startswith("0x") and len(topic_hex) == 66:
+            return "0x" + topic_hex[-40:]
+    except Exception:
+        return None
+    return None
+
+
+def _etherscan_worker_loop():
+    global _etherscan_last_ts, _etherscan_last_error, _etherscan_last_found, _etherscan_last_fromblock
+    # Start from recent window
+    from_block = None
+    while True:
+        try:
+            _etherscan_last_ts = time.time()
+            _etherscan_last_error = None
+            _etherscan_last_found = 0
+            latest = _rpc_block_number() or 0
+            if from_block is None:
+                # back 600 blocks (~2 hours on Ethereum) as initial sweep, bounded >= 1
+                from_block = max(latest - 600, 1)
+            # keep range tight for rate limits
+            to_block = latest
+            logs = _etherscan_getlogs(from_block, to_block)
+            _etherscan_last_fromblock = from_block
+            if logs is None:
+                _etherscan_last_error = "getlogs_failed"
+            else:
+                found = 0
+                if DB_ENABLED and logs:
+                    s = SessionLocal()
+                    try:
+                        for ev in logs:
+                            try:
+                                txh = ev.get("transactionHash") or ev.get("transactionHash".lower())
+                                idx = ev.get("logIndex")
+                                ext_id = f"{txh}:{idx}"
+                                # dedupe
+                                exists = s.query(IngestEvent).filter(
+                                    IngestEvent.source == "etherscan",
+                                    IngestEvent.external_id == str(ext_id),
+                                ).first()
+                                if exists:
+                                    continue
+                                topics = ev.get("topics") or []
+                                from_addr = _decode_topic_address(topics[1]) if len(topics) > 1 else None
+                                to_addr = _decode_topic_address(topics[2]) if len(topics) > 2 else None
+                                data_hex = ev.get("data") or "0x0"
+                                value = int(data_hex, 16)
+                                amount_usdt = float(value) / float(10 ** int(os.getenv("USDT_DECIMALS") or 6))
+                                # Only micro amounts
+                                if amount_usdt <= RESIDUAL_MICRO_THRESHOLD_USDT and amount_usdt > 0:
+                                    now = datetime.utcnow()
+                                    ie = IngestEvent(
+                                        source="etherscan",
+                                        event_type="poll",
+                                        external_id=str(ext_id),
+                                        trace_id=str(txh or ""),
+                                        amount=amount_usdt,
+                                        currency="USDT",
+                                        amount_usd=amount_usdt,
+                                        fx_rate_to_usd=1.0,
+                                        geo=None,
+                                        merchant=None,
+                                        merchant_lang=None,
+                                        mcc=None,
+                                        country_from=None,
+                                        country_to=None,
+                                        is_cross_border="N",
+                                        source_tz=None,
+                                        status="received",
+                                        received_at=now,
+                                        raw_json=json.dumps(ev)[:200000],
+                                    )
+                                    s.add(ie)
+                                    # credit pool
+                                    pe = PoolEvent(kind="add", amount=amount_usdt, currency="USDT", note=f"etherscan_micro {txh}", timestamp=now)
+                                    s.add(pe)
+                                    found += 1
+                            except Exception:
+                                continue
+                        s.commit()
+                    finally:
+                        s.close()
+                _etherscan_last_found = found
+                # advance from_block conservatively to avoid gaps
+                from_block = max(to_block - 5, 1)
+        except Exception as e:
+            _etherscan_last_error = str(e)
+        time.sleep(max(ETHERSCAN_POLL_INTERVAL, 10))
+
+
+@app.route("/api/v1/etherscan/status", methods=["GET"])
+def api_etherscan_status():
+    return _json_ok({
+        "enabled": bool(ETHERSCAN_ENABLED),
+        "last_ts": int(_etherscan_last_ts or 0),
+        "last_error": _etherscan_last_error,
+        "last_found": int(_etherscan_last_found or 0),
+        "last_from_block": int(_etherscan_last_fromblock or 0),
+        "threshold_usdt": RESIDUAL_MICRO_THRESHOLD_USDT,
+        "interval_sec": ETHERSCAN_POLL_INTERVAL,
+    })
+
+# Direct route alias to avoid 404 if blueprint mounting is delayed
+@app.route("/api/v1/etherscan/status", methods=["GET"])
+def api_etherscan_status_alias():  # type: ignore
+    return api_etherscan_status()
 
 def _read_usdt_balance_human() -> Optional[float]:
     try:
@@ -188,8 +620,16 @@ def _read_last_echo_info() -> Dict[str, Any]:
 
 
 def _compute_echo_totals() -> Dict[str, float]:
-    """Return total USDT sent and total recovered Echo (echo_interest)."""
+    """Return total USDT sent and total recovered Echo; cache for 15 minutes."""
     totals = {"total_usdt": 0.0, "total_residual": 0.0}
+    # 15-minute cache
+    now_ts = int(time.time())
+    try:
+        if hasattr(_compute_echo_totals, "_cache") and hasattr(_compute_echo_totals, "_cache_ts"):
+            if isinstance(_compute_echo_totals._cache_ts, int) and (now_ts - _compute_echo_totals._cache_ts) < (15*60):
+                return _compute_echo_totals._cache  # type: ignore
+    except Exception:
+        pass
     if not DB_ENABLED:
         return totals
     session = SessionLocal()
@@ -204,6 +644,12 @@ def _compute_echo_totals() -> Dict[str, float]:
             float(e.amount or 0.0) for e in subs
         )
         totals["pool_total"] = round(pool_total, 6)
+        # update cache
+        try:
+            _compute_echo_totals._cache = totals  # type: ignore
+            _compute_echo_totals._cache_ts = now_ts  # type: ignore
+        except Exception:
+            pass
         return totals
     except Exception:
         return totals
@@ -358,7 +804,8 @@ def _verify_api_hmac() -> Optional[Response]:
         ts = int(ts_raw)
         if abs(time.time() - ts) > HMAC_TTL_SECONDS:
             return _json_err("expired", 401)
-        body = request.get_data(cache=False) or b""
+        # Important: keep request body cached so downstream handlers can still parse JSON
+        body = request.get_data(cache=True) or b""
         msg = f"{request.method}\n{request.path}\n{ts_raw}\n".encode("utf-8") + body
         mac = hmac.new(API_HMAC_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, sig):
@@ -466,16 +913,34 @@ api_v1 = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 BINANCE_ENABLE = (os.getenv("BINANCE_ENABLE", "true").lower() in ["1","true","yes","y"])
 BINANCE_SYMBOLS = [s.strip().upper() for s in (os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(",")) if s.strip()]
 FX_USD_ZAR_URL = os.getenv("FX_USD_ZAR_URL", "https://api.exchangerate.host/latest?base=USD&symbols=ZAR")
+USD_ZAR_OVERRIDE = os.getenv("USD_ZAR_OVERRIDE")
+FX_ALLOW_INSECURE = (os.getenv("FX_ALLOW_INSECURE", "true").lower() in ["1","true","yes","y"])  # fallback verify=False for dev
 
 
-def _fetch_json(url: str, timeout: int = 10) -> Optional[dict]:
+_DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _fetch_json(url: str, timeout: int = 10, allow_insecure_fallback: bool = True) -> Optional[dict]:
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, timeout=timeout, headers=_DEFAULT_HEADERS)
         r.raise_for_status()
         j = r.json()
         if isinstance(j, dict) or isinstance(j, list):
             return j  # type: ignore
     except Exception:
+        # Optional insecure retry for HTTPS endpoints in constrained environments
+        try:
+            if allow_insecure_fallback and FX_ALLOW_INSECURE and url.lower().startswith("https://"):
+                r = requests.get(url, timeout=timeout, verify=False, headers=_DEFAULT_HEADERS)  # type: ignore[arg-type]
+                r.raise_for_status()
+                j = r.json()
+                if isinstance(j, dict) or isinstance(j, list):
+                    return j  # type: ignore
+        except Exception:
+            return None
         return None
     return None
 
@@ -501,16 +966,79 @@ def _binance_prices(symbols: list[str]) -> dict:
 
 
 def _fx_usd_zar() -> Optional[float]:
+    # Manual override for environments with blocked FX APIs
+    try:
+        if USD_ZAR_OVERRIDE is not None:
+            val = float(USD_ZAR_OVERRIDE)
+            if val > 0:
+                return val
+    except Exception:
+        pass
+
+    # Try exchangerate.host convert endpoint first (direct 1 USD → ZAR)
+    try:
+        j = _fetch_json("https://api.exchangerate.host/convert?from=USD&to=ZAR&amount=1")
+        if isinstance(j, dict):
+            val = j.get("result")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    except Exception:
+        pass
+
+    # Fallback to configured URL (default: latest?base=USD&symbols=ZAR)
     try:
         j = _fetch_json(FX_USD_ZAR_URL)
         if isinstance(j, dict):
-            # exchangerate.host format
             rates = j.get("rates") or {}
             val = rates.get("ZAR")
-            if val is not None:
+            if isinstance(val, (int, float)) and val > 0:
                 return float(val)
     except Exception:
-        return None
+        pass
+
+    # Fallback to frankfurter.app
+    try:
+        j = _fetch_json("https://api.frankfurter.app/latest?from=USD&to=ZAR")
+        if isinstance(j, dict):
+            rates = j.get("rates") or {}
+            val = rates.get("ZAR")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    except Exception:
+        pass
+
+    # Fallback to open.er-api.com
+    try:
+        j = _fetch_json("https://open.er-api.com/v6/latest/USD")
+        if isinstance(j, dict):
+            rates = j.get("rates") or {}
+            val = rates.get("ZAR")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    except Exception:
+        pass
+
+    # Fallback to jsdelivr community rates
+    try:
+        j = _fetch_json("https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@1/latest/currencies/usd/zar.json")
+        if isinstance(j, dict):
+            val = j.get("zar")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    except Exception:
+        pass
+
+    # Fallback to CoinGecko tether→ZAR (USDT≈USD)
+    try:
+        j = _fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=zar")
+        if isinstance(j, dict):
+            tether = j.get("tether") or {}
+            val = tether.get("zar")
+            if isinstance(val, (int, float)) and val > 0:
+                return float(val)
+    except Exception:
+        pass
+
     return None
 
 
@@ -580,6 +1108,9 @@ def api_home():
     # movement rate proxy: pending residuals + last timestamp recency
     last = _read_last_echo_info()
     totals = _compute_echo_totals()
+    pool_total = float(totals.get("pool_total", 0.0) or 0.0)
+    pool_usdt_value = round(pool_total, 6)
+    pool_zar_value = round(pool_total * float(usd_zar or 0.0), 2)
     pending = 0
     if DB_ENABLED:
         try:
@@ -598,7 +1129,9 @@ def api_home():
         "health": health,
         "movement_pending": int(pending),
         "last_timestamp": last.get("timestamp"),
-        "pool_total": totals.get("pool_total", 0.0),
+        "pool_total": pool_total,
+        "pool_usdt_value": pool_usdt_value,
+        "pool_zar_value": pool_zar_value,
         "server_time": int(time.time()),
     })
 
@@ -665,8 +1198,23 @@ def api_openapi():
             "/api/v1/metrics": {"get": {"summary": "Metrics", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/handshake/status": {"get": {"summary": "Background handshake status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reconcile/status": {"get": {"summary": "Payout reconciler status", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/mempool/status": {"get": {"summary": "BTC mempool dust harvester status", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/etherscan/status": {"get": {"summary": "Etherscan harvester status", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/reload": {"post": {"summary": "Reload env", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/ingest/status": {"get": {"summary": "Ingest status (last 24h)", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/ingest/paypal": {"post": {"summary": "PayPal webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/ingest/stripe": {"post": {"summary": "Stripe webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/paypal": {"post": {"summary": "PayPal webhook alias (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/stripe": {"post": {"summary": "Stripe webhook alias (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/flutterwave": {"post": {"summary": "Flutterwave webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/payu": {"post": {"summary": "PayU webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/mpesa": {"post": {"summary": "M-Pesa webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/ingest/voucher/1voucher": {"post": {"summary": "1Voucher webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/ingest/voucher/ott": {"post": {"summary": "OTT Voucher webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/flow/status": {"get": {"summary": "Pipeline status: Harvested→Validated→Aggregated→Payout→Proof", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/gambling/transactions": {"get": {"summary": "List ingest transactions (optional mcc,country,trace_id)", "responses": {"200": {"description": "OK"}}}},
+            "/api/v1/gambling/transactions/{tid}": {"get": {"summary": "Get gambling transaction by id", "parameters": [{"name": "tid", "in": "path", "required": True, "schema": {"type": "integer"}}], "responses": {"200": {"description": "OK"}, "404": {"description": "Not found"}}}},
+            "/api/v1/gambling/trace/{trace_id}": {"get": {"summary": "Get full trace by trace_id", "parameters": [{"name": "trace_id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "404": {"description": "Not found"}}}},
             "/api/v1/payout/quote": {"post": {"summary": "Quote payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/send": {"post": {"summary": "Send payout", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/payout/{id}": {"get": {"summary": "Get payout by id/key/tx", "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "OK"}, "404": {"description": "Not found"}}}},
@@ -1283,6 +1831,319 @@ def admin_reload():
     return jsonify(res), 200
 
 
+# ---------------- Gambling-focused read-only endpoints ---------------- #
+@api_v1.route("/gambling/transactions", methods=["GET"])
+def api_gambling_transactions():
+    if not DB_ENABLED:
+        return _json_ok({"items": [], "total": 0})
+    try:
+        s = SessionLocal()
+        try:
+            q = s.query(IngestEvent)
+            # optional filters
+            country = request.args.get("country")
+            if country:
+                q = q.filter((IngestEvent.country_from == country) | (IngestEvent.country_to == country))
+            trace = request.args.get("trace_id")
+            if trace:
+                q = q.filter(IngestEvent.trace_id == trace)
+            mcc = request.args.get("mcc")
+            if mcc:
+                q = q.filter(IngestEvent.mcc == mcc)
+            limit = int(request.args.get("limit", "50"))
+            items = q.order_by(IngestEvent.id.desc()).limit(max(min(limit, 200), 1)).all()
+            # Fallback: raw SQL in case ORM query unexpectedly returns empty
+            if not items:
+                try:
+                    lim = max(min(limit, 200), 1)
+                    rows = engine.execute(f"SELECT id FROM ingest_events ORDER BY id DESC LIMIT {lim}").fetchall()  # type: ignore
+                    ids = [int(r[0]) for r in rows]
+                    if ids:
+                        items = s.query(IngestEvent).filter(IngestEvent.id.in_(ids)).order_by(IngestEvent.id.desc()).all()
+                except Exception:
+                    pass
+            return _json_ok({
+                "items": [e.as_public() for e in items],
+                "total": len(items),
+            })
+        finally:
+            s.close()
+    except Exception as e:
+        return _json_err("db_error", str(e))
+
+
+@api_v1.route("/gambling/transactions/<int:tid>", methods=["GET"])
+def api_gambling_transaction_get(tid: int):
+    if not DB_ENABLED:
+        return _json_err("db_disabled", "database not enabled"), 500
+    try:
+        s = SessionLocal()
+        try:
+            e = s.query(IngestEvent).filter(IngestEvent.id == tid).first()
+            if not e:
+                return _json_err("not_found", "transaction not found"), 404
+            return _json_ok(e.as_public())
+        finally:
+            s.close()
+    except Exception as e:
+        return _json_err("db_error", str(e))
+
+
+@api_v1.route("/gambling/trace/<trace_id>", methods=["GET"])
+def api_gambling_trace(trace_id: str):
+    if not DB_ENABLED:
+        return _json_err("db_disabled", "database not enabled"), 500
+    try:
+        s = SessionLocal()
+        try:
+            events = s.query(IngestEvent).filter(IngestEvent.trace_id == trace_id).order_by(IngestEvent.id.asc()).all()
+            edges = s.query(TraceEdge).filter(TraceEdge.trace_id == trace_id).order_by(TraceEdge.id.asc()).all()
+            return _json_ok({
+                "trace_id": trace_id,
+                "events": [e.as_public() for e in events],
+                "edges": [{
+                    "id": ed.id,
+                    "from_event_id": ed.from_event_id,
+                    "to_event_id": ed.to_event_id,
+                    "relation": ed.relation,
+                } for ed in edges],
+            })
+        finally:
+            s.close()
+    except Exception as e:
+        return _json_err("db_error", str(e))
+
+
+# ---------------- Ingest webhook endpoints (HMAC-protected) ---------------- #
+def _fx_to_usd(currency: Optional[str], amount: Optional[float]) -> (Optional[float], Optional[float]):
+    try:
+        if currency is None or amount is None:
+            return None, None
+        c = currency.upper().strip()
+        if c == "USD":
+            return float(amount), 1.0
+        url = f"https://api.exchangerate.host/convert?from={c}&to=USD&amount={amount}"
+        j = _fetch_json(url)
+        if isinstance(j, dict):
+            res = j.get("result")
+            info = j.get("info") or {}
+            rate = info.get("rate")
+            if res is not None:
+                return float(res), (float(rate) if rate is not None else None)
+    except Exception:
+        pass
+    return None, None
+
+
+def _insert_ingest_event(source: str, payload: dict) -> int:
+    if not DB_ENABLED:
+        return 0
+    s = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        # best-effort normalization
+        amount = None
+        currency = None
+        mcc = None
+        merchant = None
+        country_from = None
+        country_to = None
+        trace_id = payload.get("trace_id") or payload.get("id") or payload.get("event_id") or payload.get("payment_intent")
+        # common fields across providers
+        for key in ["amount", "amount_total", "value", "gross_amount", "payment_amount"]:
+            v = payload.get(key)
+            if isinstance(v, (int, float)):
+                amount = float(v)
+                break
+        for key in ["currency", "currency_code", "ccy"]:
+            v = payload.get(key)
+            if isinstance(v, str):
+                currency = v
+                break
+        # Fallback: PayPal-style nested amount
+        try:
+            if (amount is None or currency is None) and isinstance(payload.get("resource"), dict):
+                ra = payload["resource"].get("amount")
+                if isinstance(ra, dict):
+                    if amount is None:
+                        total = ra.get("total") or ra.get("value")
+                        if isinstance(total, str) and total.strip() != "":
+                            amount = float(total)
+                        elif isinstance(total, (int, float)):
+                            amount = float(total)
+                    if currency is None:
+                        ccy = ra.get("currency") or ra.get("currency_code")
+                        if isinstance(ccy, str):
+                            currency = ccy
+        except Exception:
+            pass
+        for key in ["mcc", "merchant_category_code"]:
+            v = payload.get(key)
+            if v is not None:
+                mcc = str(v)
+                break
+        for key in ["merchant", "merchant_name", "description"]:
+            v = payload.get(key)
+            if isinstance(v, str):
+                merchant = v
+                break
+        country_from = payload.get("country_from") or payload.get("origin_country")
+        country_to = payload.get("country_to") or payload.get("destination_country")
+
+        amount_usd, rate = _fx_to_usd(currency, amount)
+
+        ev = IngestEvent(
+            source=source,
+            event_type="webhook",
+            external_id=str(payload.get("id") or ""),
+            trace_id=str(trace_id or ""),
+            amount=(float(amount) if amount is not None else None),
+            currency=(currency or None),
+            amount_usd=(float(amount_usd) if amount_usd is not None else None),
+            fx_rate_to_usd=(float(rate) if rate is not None else None),
+            geo=None,
+            merchant=merchant,
+            merchant_lang=None,
+            mcc=(str(mcc) if mcc is not None else None),
+            country_from=(str(country_from) if country_from else None),
+            country_to=(str(country_to) if country_to else None),
+            is_cross_border=("Y" if country_from and country_to and str(country_from).upper()!=str(country_to).upper() else "N"),
+            source_tz=None,
+            status="received",
+            received_at=now,
+            raw_json=json.dumps(payload)[:200000],
+        )
+        s.add(ev)
+        s.commit()
+        return int(ev.id or 0)
+    finally:
+        s.close()
+
+
+@api_v1.route("/ingest/status", methods=["GET"])
+def api_ingest_status():
+    if not DB_ENABLED:
+        return _json_ok({"total": 0})
+    s = SessionLocal()
+    try:
+        since = datetime.utcnow() - timedelta(hours=24)
+        rows = s.query(IngestEvent).filter(IngestEvent.received_at >= since).all()
+        return _json_ok({
+            "last_24h": len(rows),
+        })
+    finally:
+        s.close()
+
+
+def _ingest_guard():
+    err = _require_api_auth()
+    if err:
+        return err
+    if _rate_limited():
+        return _json_err("rate_limited", 429)
+    return None
+
+
+@api_v1.route("/ingest/paypal", methods=["POST"])
+def api_ingest_paypal():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("paypal", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/ingest/stripe", methods=["POST"])
+def api_ingest_stripe():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("stripe", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/ingest/voucher/1voucher", methods=["POST"])
+def api_ingest_1voucher():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("1voucher", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/ingest/voucher/ott", methods=["POST"])
+def api_ingest_ott():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("ott_voucher", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/webhooks/paypal", methods=["POST"])
+def api_webhook_paypal_alias():
+    return api_ingest_paypal()
+
+
+@api_v1.route("/webhooks/stripe", methods=["POST"])
+def api_webhook_stripe_alias():
+    return api_ingest_stripe()
+
+
+@api_v1.route("/webhooks/flutterwave", methods=["POST"])
+def api_webhook_flutterwave():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("flutterwave", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/webhooks/payu", methods=["POST"])
+def api_webhook_payu():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("payu", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+
+@api_v1.route("/webhooks/mpesa", methods=["POST"])
+def api_webhook_mpesa():
+    guard = _ingest_guard()
+    if guard:
+        return guard
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        eid = _insert_ingest_event("mpesa", payload)
+        return _json_ok({"id": eid})
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
 @app.route("/admin/invoke", methods=["POST"])
 def admin_invoke():
     auth_failed = _require_auth()
@@ -1694,6 +2555,7 @@ if RPC_URL and Web3 is not None:
 
 def _refresh_config_from_env() -> Dict[str, Any]:
     global RPC_URL, PRIVATE_KEY, CHAIN_ID, CONTRACT_ADDRESS, CONTRACT_ABI_PATH, CONTRACT_ABI_JSON, USDT_DECIMALS, w3
+    global USD_ZAR_OVERRIDE, FX_USD_ZAR_URL, FX_ALLOW_INSECURE
     try:
         # Reload .env if present
         try:
@@ -1708,6 +2570,9 @@ def _refresh_config_from_env() -> Dict[str, Any]:
         CONTRACT_ABI_PATH = os.getenv("CONTRACT_ABI_PATH", CONTRACT_ABI_PATH or "contract-abi.json")
         CONTRACT_ABI_JSON = os.getenv("CONTRACT_ABI_JSON")
         USDT_DECIMALS = int(os.getenv("USDT_DECIMALS", str(USDT_DECIMALS or 6)))
+        USD_ZAR_OVERRIDE = os.getenv("USD_ZAR_OVERRIDE")
+        FX_USD_ZAR_URL = os.getenv("FX_USD_ZAR_URL", FX_USD_ZAR_URL)
+        FX_ALLOW_INSECURE = (os.getenv("FX_ALLOW_INSECURE", "true").lower() in ["1","true","yes","y"])  # noqa: F841
 
         # Recreate web3
         w3 = None
@@ -2095,6 +2960,16 @@ if __name__ == "__main__":
             tr = threading.Thread(target=_reconcile_worker_loop, daemon=True)
             tr.start()
             _reconcile_thread_started = True
+        # Start etherscan harvester if configured
+        if ETHERSCAN_ENABLED and not _etherscan_thread_started:
+            te = threading.Thread(target=_etherscan_worker_loop, daemon=True)
+            te.start()
+            _etherscan_thread_started = True
+        # Start mempool harvester if configured
+        if MEMPOOL_ENABLED and not _mempool_thread_started:
+            tm = threading.Thread(target=_mempool_worker_loop, daemon=True)
+            tm.start()
+            _mempool_thread_started = True
     except Exception:
         pass
     app.run(host="0.0.0.0", port=port)

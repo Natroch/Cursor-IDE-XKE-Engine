@@ -1,0 +1,388 @@
+﻿{
+    "info":  {
+                 "title":  "XamKwe Echo API",
+                 "version":  "1.0.0"
+             },
+    "openapi":  "3.1.0",
+    "paths":  {
+                  "/api/v1/balance":  {
+                                          "get":  {
+                                                      "responses":  {
+                                                                        "200":  {
+                                                                                    "description":  "OK"
+                                                                                }
+                                                                    },
+                                                      "summary":  "USDT balance"
+                                                  }
+                                      },
+                  "/api/v1/config":  {
+                                         "get":  {
+                                                     "responses":  {
+                                                                       "200":  {
+                                                                                   "description":  "OK"
+                                                                               }
+                                                                   },
+                                                     "summary":  "Config"
+                                                 }
+                                     },
+                  "/api/v1/etherscan/status":  {
+                                                   "get":  {
+                                                               "responses":  {
+                                                                                 "200":  {
+                                                                                             "description":  "OK"
+                                                                                         }
+                                                                             },
+                                                               "summary":  "Etherscan harvester status"
+                                                           }
+                                               },
+                  "/api/v1/flow/status":  {
+                                              "get":  {
+                                                          "responses":  {
+                                                                            "200":  {
+                                                                                        "description":  "OK"
+                                                                                    }
+                                                                        },
+                                                          "summary":  "Pipeline status: Harvested→Validated→Aggregated→Payout→Proof"
+                                                      }
+                                          },
+                  "/api/v1/gambling/trace/{trace_id}":  {
+                                                            "get":  {
+                                                                        "parameters":  [
+                                                                                           {
+                                                                                               "in":  "path",
+                                                                                               "name":  "trace_id",
+                                                                                               "required":  true,
+                                                                                               "schema":  {
+                                                                                                              "type":  "string"
+                                                                                                          }
+                                                                                           }
+                                                                                       ],
+                                                                        "responses":  {
+                                                                                          "200":  {
+                                                                                                      "description":  "OK"
+                                                                                                  },
+                                                                                          "404":  {
+                                                                                                      "description":  "Not found"
+                                                                                                  }
+                                                                                      },
+                                                                        "summary":  "Get full trace by trace_id"
+                                                                    }
+                                                        },
+                  "/api/v1/gambling/transactions":  {
+                                                        "get":  {
+                                                                    "responses":  {
+                                                                                      "200":  {
+                                                                                                  "description":  "OK"
+                                                                                              }
+                                                                                  },
+                                                                    "summary":  "List ingest transactions (optional mcc,country,trace_id)"
+                                                                }
+                                                    },
+                  "/api/v1/gambling/transactions/{tid}":  {
+                                                              "get":  {
+                                                                          "parameters":  [
+                                                                                             {
+                                                                                                 "in":  "path",
+                                                                                                 "name":  "tid",
+                                                                                                 "required":  true,
+                                                                                                 "schema":  {
+                                                                                                                "type":  "integer"
+                                                                                                            }
+                                                                                             }
+                                                                                         ],
+                                                                          "responses":  {
+                                                                                            "200":  {
+                                                                                                        "description":  "OK"
+                                                                                                    },
+                                                                                            "404":  {
+                                                                                                        "description":  "Not found"
+                                                                                                    }
+                                                                                        },
+                                                                          "summary":  "Get gambling transaction by id"
+                                                                      }
+                                                          },
+                  "/api/v1/handshake/status":  {
+                                                   "get":  {
+                                                               "responses":  {
+                                                                                 "200":  {
+                                                                                             "description":  "OK"
+                                                                                         }
+                                                                             },
+                                                               "summary":  "Background handshake status"
+                                                           }
+                                               },
+                  "/api/v1/health":  {
+                                         "get":  {
+                                                     "responses":  {
+                                                                       "200":  {
+                                                                                   "description":  "OK"
+                                                                               }
+                                                                   },
+                                                     "summary":  "Health"
+                                                 }
+                                     },
+                  "/api/v1/home":  {
+                                       "get":  {
+                                                   "responses":  {
+                                                                     "200":  {
+                                                                                 "description":  "OK"
+                                                                             }
+                                                                 },
+                                                   "summary":  "Home summary (balance, health, movement)"
+                                               }
+                                   },
+                  "/api/v1/ingest/paypal":  {
+                                                "post":  {
+                                                             "responses":  {
+                                                                               "200":  {
+                                                                                           "description":  "OK"
+                                                                                       },
+                                                                               "401":  {
+                                                                                           "description":  "Unauthorized"
+                                                                                       }
+                                                                           },
+                                                             "summary":  "PayPal webhook (HMAC)"
+                                                         }
+                                            },
+                  "/api/v1/ingest/status":  {
+                                                "get":  {
+                                                            "responses":  {
+                                                                              "200":  {
+                                                                                          "description":  "OK"
+                                                                                      }
+                                                                          },
+                                                            "summary":  "Ingest status (last 24h)"
+                                                        }
+                                            },
+                  "/api/v1/ingest/stripe":  {
+                                                "post":  {
+                                                             "responses":  {
+                                                                               "200":  {
+                                                                                           "description":  "OK"
+                                                                                       },
+                                                                               "401":  {
+                                                                                           "description":  "Unauthorized"
+                                                                                       }
+                                                                           },
+                                                             "summary":  "Stripe webhook (HMAC)"
+                                                         }
+                                            },
+                  "/api/v1/ingest/voucher/1voucher":  {
+                                                          "post":  {
+                                                                       "responses":  {
+                                                                                         "200":  {
+                                                                                                     "description":  "OK"
+                                                                                                 },
+                                                                                         "401":  {
+                                                                                                     "description":  "Unauthorized"
+                                                                                                 }
+                                                                                     },
+                                                                       "summary":  "1Voucher webhook (HMAC)"
+                                                                   }
+                                                      },
+                  "/api/v1/ingest/voucher/ott":  {
+                                                     "post":  {
+                                                                  "responses":  {
+                                                                                    "200":  {
+                                                                                                "description":  "OK"
+                                                                                            },
+                                                                                    "401":  {
+                                                                                                "description":  "Unauthorized"
+                                                                                            }
+                                                                                },
+                                                                  "summary":  "OTT Voucher webhook (HMAC)"
+                                                              }
+                                                 },
+                  "/api/v1/market/quote":  {
+                                               "get":  {
+                                                           "parameters":  [
+                                                                              {
+                                                                                  "in":  "query",
+                                                                                  "name":  "symbol",
+                                                                                  "required":  true,
+                                                                                  "schema":  {
+                                                                                                 "type":  "string"
+                                                                                             }
+                                                                              }
+                                                                          ],
+                                                           "responses":  {
+                                                                             "200":  {
+                                                                                         "description":  "OK"
+                                                                                     },
+                                                                             "400":  {
+                                                                                         "description":  "Bad request"
+                                                                                     }
+                                                                         },
+                                                           "summary":  "Quote symbol in USDT and ZAR"
+                                                       }
+                                           },
+                  "/api/v1/market/status":  {
+                                                "get":  {
+                                                            "responses":  {
+                                                                              "200":  {
+                                                                                          "description":  "OK"
+                                                                                      }
+                                                                          },
+                                                            "summary":  "Market status (USDZAR + top symbols)"
+                                                        }
+                                            },
+                  "/api/v1/mempool/status":  {
+                                                 "get":  {
+                                                             "responses":  {
+                                                                               "200":  {
+                                                                                           "description":  "OK"
+                                                                                       }
+                                                                           },
+                                                             "summary":  "BTC mempool dust harvester status"
+                                                         }
+                                             },
+                  "/api/v1/metrics":  {
+                                          "get":  {
+                                                      "responses":  {
+                                                                        "200":  {
+                                                                                    "description":  "OK"
+                                                                                }
+                                                                    },
+                                                      "summary":  "Metrics"
+                                                  }
+                                      },
+                  "/api/v1/payout/quote":  {
+                                               "post":  {
+                                                            "responses":  {
+                                                                              "200":  {
+                                                                                          "description":  "OK"
+                                                                                      }
+                                                                          },
+                                                            "summary":  "Quote payout"
+                                                        }
+                                           },
+                  "/api/v1/payout/send":  {
+                                              "post":  {
+                                                           "responses":  {
+                                                                             "200":  {
+                                                                                         "description":  "OK"
+                                                                                     }
+                                                                         },
+                                                           "summary":  "Send payout"
+                                                       }
+                                          },
+                  "/api/v1/payout/{id}":  {
+                                              "get":  {
+                                                          "parameters":  [
+                                                                             {
+                                                                                 "in":  "path",
+                                                                                 "name":  "id",
+                                                                                 "required":  true,
+                                                                                 "schema":  {
+                                                                                                "type":  "string"
+                                                                                            }
+                                                                             }
+                                                                         ],
+                                                          "responses":  {
+                                                                            "200":  {
+                                                                                        "description":  "OK"
+                                                                                    },
+                                                                            "404":  {
+                                                                                        "description":  "Not found"
+                                                                                    }
+                                                                        },
+                                                          "summary":  "Get payout by id/key/tx"
+                                                      }
+                                          },
+                  "/api/v1/reconcile/status":  {
+                                                   "get":  {
+                                                               "responses":  {
+                                                                                 "200":  {
+                                                                                             "description":  "OK"
+                                                                                         }
+                                                                             },
+                                                               "summary":  "Payout reconciler status"
+                                                           }
+                                               },
+                  "/api/v1/reload":  {
+                                         "post":  {
+                                                      "responses":  {
+                                                                        "200":  {
+                                                                                    "description":  "OK"
+                                                                                }
+                                                                    },
+                                                      "summary":  "Reload env"
+                                                  }
+                                     },
+                  "/api/v1/status":  {
+                                         "get":  {
+                                                     "responses":  {
+                                                                       "200":  {
+                                                                                   "description":  "OK"
+                                                                               }
+                                                                   },
+                                                     "summary":  "Status"
+                                                 }
+                                     },
+                  "/api/v1/webhooks/flutterwave":  {
+                                                       "post":  {
+                                                                    "responses":  {
+                                                                                      "200":  {
+                                                                                                  "description":  "OK"
+                                                                                              },
+                                                                                      "401":  {
+                                                                                                  "description":  "Unauthorized"
+                                                                                              }
+                                                                                  },
+                                                                    "summary":  "Flutterwave webhook (HMAC)"
+                                                                }
+                                                   },
+                  "/api/v1/webhooks/mpesa":  {
+                                                 "post":  {
+                                                              "responses":  {
+                                                                                "200":  {
+                                                                                            "description":  "OK"
+                                                                                        },
+                                                                                "401":  {
+                                                                                            "description":  "Unauthorized"
+                                                                                        }
+                                                                            },
+                                                              "summary":  "M-Pesa webhook (HMAC)"
+                                                          }
+                                             },
+                  "/api/v1/webhooks/paypal":  {
+                                                  "post":  {
+                                                               "responses":  {
+                                                                                 "200":  {
+                                                                                             "description":  "OK"
+                                                                                         },
+                                                                                 "401":  {
+                                                                                             "description":  "Unauthorized"
+                                                                                         }
+                                                                             },
+                                                               "summary":  "PayPal webhook alias (HMAC)"
+                                                           }
+                                              },
+                  "/api/v1/webhooks/payu":  {
+                                                "post":  {
+                                                             "responses":  {
+                                                                               "200":  {
+                                                                                           "description":  "OK"
+                                                                                       },
+                                                                               "401":  {
+                                                                                           "description":  "Unauthorized"
+                                                                                       }
+                                                                           },
+                                                             "summary":  "PayU webhook (HMAC)"
+                                                         }
+                                            },
+                  "/api/v1/webhooks/stripe":  {
+                                                  "post":  {
+                                                               "responses":  {
+                                                                                 "200":  {
+                                                                                             "description":  "OK"
+                                                                                         },
+                                                                                 "401":  {
+                                                                                             "description":  "Unauthorized"
+                                                                                         }
+                                                                             },
+                                                               "summary":  "Stripe webhook alias (HMAC)"
+                                                           }
+                                              }
+              }
+}

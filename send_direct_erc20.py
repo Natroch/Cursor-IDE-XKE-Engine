@@ -62,13 +62,17 @@ def main() -> None:
     amount_units = int(Decimal(amount_str) * (10 ** decimals))
 
     nonce = w3.eth.get_transaction_count(account.address)
+    chain_id = w3.eth.chain_id
     latest_block = w3.eth.get_block("latest")
     base_fee = latest_block.get("baseFeePerGas") or w3.to_wei("5", "gwei")
     try:
-        priority = w3.eth.max_priority_fee
+        # web3 v6 returns an int here
+        priority = int(getattr(w3.eth, "max_priority_fee", w3.to_wei("2", "gwei")))
+        if priority <= 0:
+            priority = w3.to_wei("2", "gwei")
     except Exception:
         priority = w3.to_wei("2", "gwei")
-    max_fee = base_fee * 2 + priority
+    max_fee = int(base_fee) * 2 + int(priority)
 
     # Gas limit estimation first, so build_transaction doesn't try to auto-estimate
     try:
@@ -79,18 +83,34 @@ def main() -> None:
     except Exception:
         gas_limit = 100_000
 
-    tx = token.functions.transfer(Web3.to_checksum_address(recipient), amount_units).build_transaction(
-        {
-            "from": account.address,
-            "nonce": nonce,
-            "maxFeePerGas": int(max_fee),
-            "maxPriorityFeePerGas": int(priority),
-            "gas": gas_limit,
-        }
-    )
-
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    # First try EIP-1559
+    try:
+        tx = token.functions.transfer(Web3.to_checksum_address(recipient), amount_units).build_transaction(
+            {
+                "from": account.address,
+                "nonce": nonce,
+                "chainId": int(chain_id),
+                "maxFeePerGas": int(max_fee),
+                "maxPriorityFeePerGas": int(priority),
+                "gas": int(gas_limit),
+            }
+        )
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
+    except Exception:
+        # Fallback to legacy gasPrice mode for nodes that reject 1559 on send
+        gas_price = w3.eth.gas_price
+        tx = token.functions.transfer(Web3.to_checksum_address(recipient), amount_units).build_transaction(
+            {
+                "from": account.address,
+                "nonce": nonce,
+                "chainId": int(chain_id),
+                "gas": int(gas_limit),
+                "gasPrice": int(gas_price),
+            }
+        )
+        signed = account.sign_transaction(tx)
+        tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
     print("submitted:", tx_hash.hex())
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300, poll_latency=5)
     print({
