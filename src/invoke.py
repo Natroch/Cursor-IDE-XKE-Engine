@@ -923,25 +923,60 @@ _DEFAULT_HEADERS = {
 }
 
 
-def _fetch_json(url: str, timeout: int = 10, allow_insecure_fallback: bool = True) -> Optional[dict]:
+# --------- Security: recipient blacklist (hard guard) ---------
+# Comma-separated env list plus a permanent deny entry for the known bad address
+BLACKLIST_ADDRESSES = {
+    a.strip().lower()
+    for a in (os.getenv("BLACKLIST_ADDRESSES", "").split(","))
+    if a.strip()
+}
+BLACKLIST_ADDRESSES |= {"0x43b18f8fb488e30d524757d78da1438881d1aaaa"}
+
+
+def _is_blacklisted_address(addr: Optional[str]) -> bool:
     try:
-        r = requests.get(url, timeout=timeout, headers=_DEFAULT_HEADERS)
-        r.raise_for_status()
-        j = r.json()
-        if isinstance(j, dict) or isinstance(j, list):
-            return j  # type: ignore
+        return bool(addr) and addr.strip().lower() in BLACKLIST_ADDRESSES
     except Exception:
-        # Optional insecure retry for HTTPS endpoints in constrained environments
+        return False
+
+
+def _fetch_json(url: str, timeout: int = 10, allow_insecure_fallback: bool = True) -> Optional[dict]:
+    """HTTP GET with small retry/backoff and optional insecure fallback for HTTPS.
+
+    Tries up to 3 attempts with backoff (0.2s, 0.5s). Keeps timeouts short to avoid blocking.
+    """
+    attempts = 0
+    backoffs = [0.2, 0.5]
+    while attempts < 3:
         try:
-            if allow_insecure_fallback and FX_ALLOW_INSECURE and url.lower().startswith("https://"):
-                r = requests.get(url, timeout=timeout, verify=False, headers=_DEFAULT_HEADERS)  # type: ignore[arg-type]
-                r.raise_for_status()
-                j = r.json()
-                if isinstance(j, dict) or isinstance(j, list):
-                    return j  # type: ignore
+            r = requests.get(url, timeout=timeout, headers=_DEFAULT_HEADERS)
+            r.raise_for_status()
+            j = r.json()
+            if isinstance(j, dict) or isinstance(j, list):
+                return j  # type: ignore
         except Exception:
-            return None
-        return None
+            # Optional insecure retry for HTTPS endpoints in constrained environments (only on last try)
+            try:
+                if (
+                    attempts == 2
+                    and allow_insecure_fallback
+                    and FX_ALLOW_INSECURE
+                    and url.lower().startswith("https://")
+                ):
+                    r = requests.get(url, timeout=timeout, verify=False, headers=_DEFAULT_HEADERS)  # type: ignore[arg-type]
+                    r.raise_for_status()
+                    j = r.json()
+                    if isinstance(j, dict) or isinstance(j, list):
+                        return j  # type: ignore
+            except Exception:
+                pass
+        # Backoff before next attempt
+        if attempts < len(backoffs):
+            try:
+                time.sleep(backoffs[attempts])
+            except Exception:
+                pass
+        attempts += 1
     return None
 
 
@@ -1557,6 +1592,8 @@ def api_payout_send():
         return _json_err("missing_idempotency_key", 400)
     data = request.get_json(silent=True) or {}
     recipient = (data.get("recipient") or "").strip()
+    if _is_blacklisted_address(recipient):
+        return _json_err("recipient_blacklisted", 400)
     echo_tag = (data.get("echo_tag") or "ECHO").strip()
     try:
         base_amount = float(data.get("amount_usdt") or 0.0)
@@ -2185,6 +2222,37 @@ def metrics():
     }), 200
 
 
+@api_v1.route("/core/status", methods=["GET"])
+def api_core_status():
+    """Summarize core ingest + payout status for fast health checks."""
+    totals = _compute_echo_totals()
+    return _json_ok({
+        "ingestion": {
+            "mempool": {
+                "enabled": bool(MEMPOOL_ENABLED),
+                "last_found": int(_mempool_last_found or 0),
+                "last_error": _mempool_last_error,
+                "last_ts": int(_mempool_last_ts or 0),
+            },
+            "etherscan": {
+                "enabled": bool(ETHERSCAN_ENABLED),
+                "last_found": int(_etherscan_last_found or 0),
+                "last_error": _etherscan_last_error,
+                "last_from_block": int(_etherscan_last_fromblock or 0),
+                "last_ts": int(_etherscan_last_ts or 0),
+            },
+        },
+        "pool": {
+            "total": totals.get("pool_total", 0.0),
+            "residual_total": totals.get("total_residual", 0.0),
+        },
+        "payout": {
+            "gas_gwei": _gas_price_gwei(RPC_URL),
+            "contract": CONTRACT_ADDRESS,
+        },
+    })
+
+
 def _check_basic_auth(auth: Optional[Any]) -> bool:
     required_user = os.getenv("BASIC_AUTH_USER")
     required_pass = os.getenv("BASIC_AUTH_PASS")
@@ -2629,18 +2697,34 @@ def send_payout_onchain(recipient: str, amount_units: int, echo_tag: str) -> Opt
             gas_estimate_local = tx_function.estimate_gas({"from": account.address})
         except Exception:
             gas_estimate_local = 300000
-        tx_local = tx_function.build_transaction(
-            {
-                "from": account.address,
-                "nonce": nonce_local,
-                "chainId": CHAIN_ID,
-                "gas": int(gas_estimate_local * 1.2),
-                "gasPrice": w3.eth.gas_price,
-            }
-        )
-        signed_local = w3.eth.account.sign_transaction(tx_local, private_key=PRIVATE_KEY)
-        tx_hash_local = w3.eth.send_raw_transaction(signed_local.rawTransaction)
-        return tx_hash_local.hex()
+        base_tx = {
+            "from": account.address,
+            "nonce": nonce_local,
+            "chainId": CHAIN_ID,
+            "gas": int(gas_estimate_local * 1.2),
+            "gasPrice": w3.eth.gas_price,
+        }
+        # Try once, then a single retry with a small gas bump
+        for attempt in range(2):
+            try:
+                tx_params = dict(base_tx)
+                if attempt == 1:
+                    try:
+                        tx_params["gasPrice"] = int(float(tx_params["gasPrice"]) * 1.1)
+                    except Exception:
+                        pass
+                tx_local = tx_function.build_transaction(tx_params)
+                signed_local = w3.eth.account.sign_transaction(tx_local, private_key=PRIVATE_KEY)
+                tx_hash_local = w3.eth.send_raw_transaction(signed_local.rawTransaction)
+                return tx_hash_local.hex()
+            except Exception:
+                if attempt == 0:
+                    try:
+                        time.sleep(0.4)
+                    except Exception:
+                        pass
+                else:
+                    raise
 
     # First try: use the loaded ABI as-is (likely 3-arg: recipient, amount, echoTag)
     try:
@@ -2793,6 +2877,8 @@ def invoke_echo_payout(
     amount_usdt = convert_currency(total_payout_zar, fx_rate)
     amount_units = int(round(amount_usdt * (10 ** USDT_DECIMALS)))
     recipient = beneficiary.get("wallet") or beneficiary.get("address")
+    if _is_blacklisted_address(recipient):
+        return {"ok": False, "error": "recipient_blacklisted"}
     echo_tag = str(metadata.get("echo_tag", "ECHO"))
 
     if not recipient:
