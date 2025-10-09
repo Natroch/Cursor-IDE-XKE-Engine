@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XAMKWÊ Echo — Accounting</title>
+    <link rel="manifest" href="/web/manifest.json" />
+    <meta name="theme-color" content="#2563eb" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .wrap { max-width: 1000px; margin: 0 auto; }
+      h1 { font-size: 28px; margin: 0 0 8px 0; }
+      a { color:#2563eb; text-decoration:none; }
+      .nav { display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px; }
+      .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin-top: 16px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; }
+      .big { font-size: 22px; font-weight: 700; }
+      .row { display:flex; gap:12px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+      label { min-width: 140px; font-weight:600; }
+      input { padding: 10px 12px; border:1px solid #d1d5db; border-radius:6px; min-width: 160px; }
+      button { padding: 10px 14px; border: 0; background: #2563eb; color: #fff; border-radius: 6px; cursor:pointer; }
+      button.secondary { background:#6b7280; }
+      .muted { color:#6b7280; }
+      .totals { display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; }
+      .tot { border:1px solid #e5e7eb; border-radius:8px; padding:12px; text-align:center; }
+      .log { min-height: 140px; border:1px dashed #cbd5e1; border-radius:8px; padding:10px; background:#f8fafc; overflow:auto; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="nav">
+        <h1>Accounting</h1>
+        <div><a href="/" title="Back to Dashboard">← Dashboard</a></div>
+      </div>
+
+      <div class="card">
+        <div class="big">Summary</div>
+        <div class="totals" style="margin-top:10px;">
+          <div class="tot"><div class="muted">Pool Total</div><div id="poolTotal" class="big">0.000000</div></div>
+          <div class="tot"><div class="muted">Reinvested</div><div id="reinvestedTotal" class="big">0.000000</div></div>
+          <div class="tot"><div class="muted">Yield</div><div id="yieldTotal" class="big">0.000000</div></div>
+          <div class="tot"><div class="muted">True Total</div><div id="trueTotal" class="big">0.000000</div></div>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <button id="btnRefresh" class="secondary">Refresh</button>
+          <button id="btnRebuild" class="secondary">Rebuild Accounting</button>
+          <a id="btnExport" class="secondary" href="/api/v1/accounting/beancount" target="_blank" style="padding:10px 14px; border-radius:6px; background:#10b981; color:#fff;">Export Beancount</a>
+          <div id="msg" class="muted">-</div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <div class="big">Pool</div>
+          <div class="row"><label>Amount (USDT)</label><input id="pool_amt" placeholder="100" /></div>
+          <div class="row"><label>Note</label><input id="pool_note" placeholder="payment" /></div>
+          <div class="row">
+            <button id="btnPoolAdd">Add</button>
+            <button id="btnPoolWithdraw" class="secondary">Withdraw</button>
+            <div id="poolMsg" class="muted">-</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="big">Reinvest</div>
+          <div class="row"><label>Amount (USDT)</label><input id="rin_amt" placeholder="100" /></div>
+          <div class="row"><label>Note</label><input id="rin_note" placeholder="reinvest" /></div>
+          <div class="row">
+            <button id="btnRinAdd">Add</button>
+            <button id="btnRinWithdraw" class="secondary">Withdraw</button>
+            <button id="btnRinYield" class="secondary">Yield</button>
+            <button id="btnRinSweep" class="secondary">Sweep→Pool</button>
+            <div id="rinMsg" class="muted">-</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="big">Luno Bank Payout</div>
+        <div class="row"><label>Amount (ZAR)</label><input id="luno_amt" placeholder="1000" /></div>
+        <div class="row"><label>Reference</label><input id="luno_ref" placeholder="ECHO" /></div>
+        <div class="row"><label>Beneficiary ID</label><input id="luno_benef" placeholder="(optional if default in .env)" /></div>
+        <div class="row"><button id="btnLuno" class="secondary">Send Luno Payout</button><div id="lunoMsg" class="muted">-</div></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="big">Shield</div>
+        <div class="row"><div class="muted">Mode</div><div id="shieldMode" class="big">-</div></div>
+        <div class="row" style="gap:24px; flex-wrap:wrap;">
+          <div><div class="muted">Unknown (1h)</div><div id="shieldUnknown" class="big">0</div></div>
+          <div><div class="muted">Mirrors</div><div id="shieldMirror" class="big">0</div></div>
+          <div><div class="muted">429</div><div id="shield429" class="big">0</div></div>
+          <div><div class="muted">404</div><div id="shield404" class="big">0</div></div>
+          <div><div class="muted">503</div><div id="shield503" class="big">0</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="big">Log</div>
+        <div id="log" class="log"></div>
+      </div>
+    </div>
+
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/web/service-worker.js?v=3').then(reg => {
+            if (reg && reg.update) { try { reg.update(); } catch(e){} }
+          }).catch(()=>{});
+        });
+      }
+    </script>
+    <script src="/web/accounting.js"></script>
+  </body>
+ </html>
+
+

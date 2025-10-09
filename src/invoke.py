@@ -1,4 +1,5 @@
 import os
+import random
 import hmac
 import hashlib
 import time
@@ -7,9 +8,12 @@ from typing import Any, Dict, Optional
 
 import requests
 from datetime import datetime
-from flask import Flask, request, jsonify, Response, Blueprint
+from flask import Flask, request, jsonify, Response, Blueprint, send_from_directory
 import threading
 from datetime import timedelta
+from decimal import Decimal
+from urllib.parse import quote_plus
+import ipaddress
 
 # Optional database layer (disabled automatically if SQLAlchemy isn't available)
 DB_ENABLED = True
@@ -22,8 +26,15 @@ try:
         String,
         Text,
         create_engine,
+            func,
+            UniqueConstraint,
     )
-    from sqlalchemy.orm import declarative_base, sessionmaker
+    # Support both SQLAlchemy >=1.4 (orm.declarative_base) and 1.3 (ext.declarative)
+    try:
+        from sqlalchemy.orm import declarative_base, sessionmaker  # type: ignore
+    except Exception:
+        from sqlalchemy.orm import sessionmaker  # type: ignore
+        from sqlalchemy.ext.declarative import declarative_base  # type: ignore
 except Exception:
     DB_ENABLED = False
 
@@ -81,6 +92,15 @@ if DB_ENABLED:
         note = Column(String)
         timestamp = Column(DateTime)
 
+    class ReinvestEvent(Base):
+        __tablename__ = "reinvest_events"
+        id = Column(Integer, primary_key=True)
+        kind = Column(String)  # 'add' | 'yield' | 'withdraw'
+        amount = Column(Float)
+        currency = Column(String)
+        note = Column(String)
+        timestamp = Column(DateTime)
+
     class ResidualEvent(Base):
         __tablename__ = "residual_events"
         id = Column(Integer, primary_key=True)
@@ -107,6 +127,31 @@ if DB_ENABLED:
         created_at = Column(DateTime)
         updated_at = Column(DateTime)
 
+    # -------- Basic accounting entry table (minimal) -------- #
+    class AccountingEntry(Base):
+        __tablename__ = "accounting_entries"
+        id = Column(Integer, primary_key=True)
+        account = Column(String)   # 'pool' | 'reinvest_principal' | 'reinvest_yield'
+        delta = Column(Float)      # signed change in USDT-equivalent
+        currency = Column(String)
+        note = Column(String)
+        timestamp = Column(DateTime)
+
+    class Withdrawal(Base):
+        __tablename__ = "withdrawals"
+        id = Column(Integer, primary_key=True)
+        amount = Column(Float)
+        currency = Column(String)
+        source = Column(String)      # 'yield' | 'pool' | 'reinvest'
+        method = Column(String)      # 'bank' | 'payshap' | 'payfast' | 'luno'
+        status = Column(String)      # 'pending' | 'disbursed' | 'failed'
+        staged_immediate = Column(Float)
+        staged_delayed = Column(Float)
+        purpose = Column(String)
+        audit = Column(Text)
+        created_at = Column(DateTime)
+        approved_by = Column(String)
+
     # -------------- New trace-ledger and anchoring models -------------- #
     class IngestEvent(Base):
         __tablename__ = "ingest_events"
@@ -130,6 +175,9 @@ if DB_ENABLED:
         status = Column(String)              # 'received'|'processed'|'error'
         received_at = Column(DateTime)
         raw_json = Column(Text)              # original payload for audit
+        __table_args__ = (
+            UniqueConstraint("source", "external_id", name="uq_ingest_source_external"),
+        )
 
         def as_public(self) -> dict:
             # Derive amount/currency at read time if missing, using saved raw_json
@@ -237,6 +285,362 @@ else:
     Base = object  # type: ignore
 
 app = Flask(__name__)
+# ---------------- Automation config ---------------- #
+POOL_TARGET_PCT = float(os.getenv("POOL_TARGET_PCT", "0.30"))
+AUTO_REINVEST_INTERVAL_SEC = int(os.getenv("AUTO_REINVEST_INTERVAL_SEC", "300"))
+YIELD_SWEEP_INTERVAL_MIN = int(os.getenv("YIELD_SWEEP_INTERVAL_MIN", "15"))
+POOL_MIN_PCT = float(os.getenv("POOL_MIN_PCT", "0.10"))
+POOL_FLOOR_USDT = float(os.getenv("POOL_FLOOR_USDT", "0.0") or 0.0)
+AUTO_REINVEST_ENABLED = (os.getenv("AUTO_REINVEST_ENABLED", "false").lower() in ["1","true","yes","y"])  # manual by default
+YIELD_SWEEP_ENABLED = (os.getenv("YIELD_SWEEP_ENABLED", "false").lower() in ["1","true","yes","y"])      # manual by default
+WORKERS_ENABLED = (os.getenv("WORKERS_ENABLED", "true").lower() in ["1","true","yes","y"])               # default: on
+INGESTION_ONLY_ENABLED = (os.getenv("INGESTION_ONLY_ENABLED", "true").lower() in ["1","true","yes","y"])   # default: ingestion-only
+
+_auto_reinvest_started = False
+_yield_sweep_started = False
+_alerts_last: Optional[dict] = None
+
+def _auto_reinvest_worker():
+    while True:
+        try:
+            # Disabled unless explicitly enabled via env
+            if not AUTO_REINVEST_ENABLED:
+                time.sleep(max(int(AUTO_REINVEST_INTERVAL_SEC), 30))
+                continue
+            t = _compute_echo_totals()
+            true_total = float(t.get("true_total") or 0.0)
+            pool_total = float(t.get("pool_total") or 0.0)
+            target = float(true_total) * float(POOL_TARGET_PCT)
+            excess = pool_total - target
+            if excess > 0:
+                # Move 25% of excess per cycle using fluctuating rate
+                move_amt = max(excess * 0.25, 0.0)
+                # Guard: never drop pool below configured floor
+                try:
+                    floor = float(POOL_FLOOR_USDT)
+                except Exception:
+                    floor = 0.0
+                max_withdrawable = max(pool_total - floor, 0.0)
+                if move_amt > max_withdrawable:
+                    move_amt = max_withdrawable
+                if move_amt > 0:
+                    try:
+                        s = SessionLocal()
+                        try:
+                            now = datetime.utcnow()
+                            s.add(PoolEvent(kind="withdraw", amount=float(move_amt), currency="USDT", note="auto_reinvest", timestamp=now))
+                            s.add(ReinvestEvent(kind="add", amount=float(move_amt), currency="USDT", note="auto_reinvest", timestamp=now))
+                            s.commit()
+                        finally:
+                            s.close()
+                        _invalidate_totals_cache()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            time.sleep(max(int(AUTO_REINVEST_INTERVAL_SEC), 30))
+        except Exception:
+            pass
+
+def _yield_sweep_worker():
+    while True:
+        try:
+            # Disabled unless explicitly enabled via env
+            if not YIELD_SWEEP_ENABLED:
+                time.sleep(max(int(YIELD_SWEEP_INTERVAL_MIN) * 60, 60))
+                continue
+            # Expose hook for periodic actions if needed.
+            pass
+        except Exception:
+            pass
+        try:
+            time.sleep(max(int(YIELD_SWEEP_INTERVAL_MIN) * 60, 60))
+        except Exception:
+            pass
+
+def _alerts_snapshot() -> dict:
+    t = _compute_echo_totals()
+    try:
+        tt = float(t.get("true_total") or 0.0)
+        pt = float(t.get("pool_total") or 0.0)
+        liq = (pt / tt) if tt > 0 else 0.0
+        low = (liq < POOL_MIN_PCT)
+        return {"pool_total": pt, "true_total": tt, "liquidity_ratio": round(liq, 6), "pool_low": bool(low)}
+    except Exception:
+        return {"pool_total": 0.0, "true_total": 0.0, "liquidity_ratio": 0.0, "pool_low": False}
+
+def _dynamic_daily_rate_pct() -> Optional[float]:
+    """Compute a dynamic daily rate percentage (e.g., 0.05 means 0.05%/day).
+
+    Sources:
+    - REINVEST_MIN_DAILY_PCT / REINVEST_MAX_DAILY_PCT (bounds)
+    - REINVEST_VOLATILITY_PCT (jitter +-)
+    - Liquidity weighting: scales by (1 + w * (1 - liquidity_ratio))
+      where REINVEST_LIQUIDITY_WEIGHT default=0.2.
+    """
+    try:
+        mn = os.getenv("REINVEST_MIN_DAILY_PCT")
+        mx = os.getenv("REINVEST_MAX_DAILY_PCT")
+        if mn is None or mx is None or mn == "" or mx == "":
+            return None
+        rmin = float(mn)
+        rmax = float(mx)
+        if rmax < rmin:
+            rmin, rmax = rmax, rmin
+        base = random.uniform(rmin, rmax)
+        vol = float(os.getenv("REINVEST_VOLATILITY_PCT", "0") or 0.0)
+        if vol > 0:
+            base = base * (1.0 + random.uniform(-vol, vol))
+        # Liquidity weighting
+        snap = _alerts_snapshot()
+        liq = float(snap.get("liquidity_ratio") or 0.0)
+        w = float(os.getenv("REINVEST_LIQUIDITY_WEIGHT", "0.2") or 0.2)
+        # More aggressive when liquidity is lower
+        scale = 1.0 + max(min(w * (1.0 - liq), 2.0), -0.9)
+        out = base * scale
+        # clamp to [rmin*0.5, rmax*2] to avoid extremes
+        lo = rmin * 0.5
+        hi = rmax * 2.0
+        out = max(min(out, hi), lo)
+        return float(out)
+    except Exception:
+        return None
+
+
+# Feature flags to keep the app in off-chain mode and restrict to PayFast + live streams
+OFFCHAIN_ONLY = (os.getenv("OFFCHAIN_ONLY", "true").lower() in ["1","true","yes","y"])
+ENABLE_ONLY_PAYFAST = (os.getenv("ENABLE_ONLY_PAYFAST", "true").lower() in ["1","true","yes","y"])
+
+# Reinvestment model configuration
+REINVEST_APR = float(os.getenv("REINVEST_APR", "0.10") or "0.10")  # e.g., 0.10 = 10% APR
+REINVEST_COMPOUND = (os.getenv("REINVEST_COMPOUND", "false").lower() in ["1","true","yes","y"])
+REINVEST_DAILY_RATE_PCT = os.getenv("REINVEST_DAILY_RATE_PCT", "").strip()  # e.g., "0.05" for 0.05%/day
+
+############################
+# Dead Shield (cocoon) gate
+############################
+
+# Modes: off | on | dead (hard-disabled)
+SHIELD_MODE = "off"
+# Comma-separated list of IPs or CIDRs that bypass the shield (always allowed)
+_shield_allow_raw = [s.strip() for s in (os.getenv("SHIELD_ALLOW_IPS", "127.0.0.1,::1").split(",")) if s.strip()]
+_shield_allow_nets = []
+for entry in _shield_allow_raw:
+    try:
+        if "/" in entry:
+            _shield_allow_nets.append(ipaddress.ip_network(entry, strict=False))
+        else:
+            _shield_allow_nets.append(ipaddress.ip_network(entry + "/32", strict=False))
+    except Exception:
+        continue
+
+try:
+    SHIELD_DELAY_MIN_MS = int(os.getenv("SHIELD_DELAY_MIN_MS", "150"))
+    SHIELD_DELAY_MAX_MS = int(os.getenv("SHIELD_DELAY_MAX_MS", "900"))
+except Exception:
+    SHIELD_DELAY_MIN_MS = 150
+    SHIELD_DELAY_MAX_MS = 900
+
+_shield_hits: dict[str, tuple[int, float]] = {}
+_shield_bucket: dict[str, tuple[float, float]] = {}
+
+# Optional mirror mode (hard-disabled)
+SHIELD_MIRROR_ENABLED = False
+SHIELD_MIRROR_HEADER = "X-Cocoon-Seen"
+
+# Shield counters for metrics (best-effort, in-memory)
+_shield_counters = {
+    "since": int(time.time()),
+    "mode": SHIELD_MODE,
+    "mirror": bool(SHIELD_MIRROR_ENABLED),
+    "unknown_total": 0,
+    "mirror_issued": 0,
+    "dead_404": 0,
+    "throttled_429": 0,
+    "offline_503": 0,
+}
+_shield_ip_counts: dict[str, int] = {}
+
+def _bucket_take(ip: str, cost: float = 1.0, fill_rate: float = 0.5, capacity: float = 5.0) -> bool:
+    try:
+        now = time.time()
+        tokens, last = _shield_bucket.get(ip, (capacity, now))
+        # Refill
+        tokens = min(capacity, tokens + (now - last) * fill_rate)
+        if tokens >= cost:
+            tokens -= cost
+            _shield_bucket[ip] = (tokens, now)
+            return True
+        _shield_bucket[ip] = (tokens, now)
+        return False
+    except Exception:
+        return False
+
+def _client_ip() -> str:
+    try:
+        fwd = request.headers.get("X-Forwarded-For")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        return (request.remote_addr or "127.0.0.1").strip()
+    except Exception:
+        return "127.0.0.1"
+
+def _ip_allowed(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        for net in _shield_allow_nets:
+            try:
+                if addr in net:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+def _shield_dead_gate():
+    # Hard-disabled
+    return None
+    ip = _client_ip()
+    # Always allow allowlisted IPs
+    if _ip_allowed(ip):
+        return None
+    try:
+        _shield_counters["unknown_total"] += 1
+        _shield_ip_counts[ip] = _shield_ip_counts.get(ip, 0) + 1
+    except Exception:
+        pass
+    # Light per-IP rate curtain to slow scans (in-memory best-effort)
+    try:
+        now = time.time()
+        count, since = _shield_hits.get(ip, (0, now))
+        if now - since > 60:
+            count, since = (0, now)
+        count += 1
+        _shield_hits[ip] = (count, since)
+        # If too chatty, add extra delay
+        extra = 0.0
+        if count > 30:
+            extra = min(1.5, (count - 30) * 0.05)
+    except Exception:
+        extra = 0.0
+
+    # Random delay to mimic dead/slow origin
+    try:
+        base_ms = random.randint(max(SHIELD_DELAY_MIN_MS, 0), max(SHIELD_DELAY_MAX_MS, SHIELD_DELAY_MIN_MS))
+    except Exception:
+        base_ms = 300
+    delay = (base_ms / 1000.0) + float(extra)
+    try:
+        time.sleep(max(min(delay, 3.0), 0.05))
+    except Exception:
+        pass
+
+    # "dead" mode always returns 404; "on" returns 429 for obvious probes to APIs
+    path = (request.path or "/").lower()
+    # Safe mirror mode for unknown IPs (no bodies; hashed headers; do-not-loop guard)
+    if SHIELD_MIRROR_ENABLED and request.headers.get(SHIELD_MIRROR_HEADER) is None:
+        # Simple token bucket so mirrors can't be abused
+        if not _bucket_take(ip, cost=1.0, fill_rate=0.4, capacity=4.0):
+            try:
+                _shield_counters["throttled_429"] += 1
+            except Exception:
+                pass
+            return jsonify({"ok": False, "error": "slow_down"}), 429
+        try:
+            # Build a tiny, salted fingerprint of request metadata
+            method = (request.method or "").upper()
+            # Limit header surface and hash it
+            interesting = [
+                (k, v)
+                for k, v in list(request.headers.items())[:10]
+                if k.lower() not in {"authorization", "cookie"}
+            ]
+            header_blob = "|".join(f"{k}:{v}" for k, v in interesting)
+            salt = str(int(time.time()) // 60)  # rotates every minute
+            digest = hashlib.sha256((method + " " + path + " " + ip + " " + salt + " " + header_blob).encode("utf-8")).hexdigest()[:16]
+            # Respond with minimal reflection and a do-not-loop header
+            resp = jsonify({
+                "ok": False,
+                "mirror": {
+                    "m": method,
+                    "p": path,
+                    "h": digest,
+                    "t": int(time.time())
+                }
+            })
+            try:
+                resp.headers[SHIELD_MIRROR_HEADER] = "1"
+            except Exception:
+                pass
+            try:
+                _shield_counters["mirror_issued"] += 1
+            except Exception:
+                pass
+            return resp, 404
+        except Exception:
+            # Fall through to standard shield behavior on any error
+            pass
+
+    if SHIELD_MODE == "dead":
+        try:
+            _shield_counters["dead_404"] += 1
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "not_found"}), 404
+    # SHIELD_MODE == "on"
+    if path.startswith("/api/") or path.startswith("/admin"):
+        try:
+            _shield_counters["throttled_429"] += 1
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": "temporarily_unavailable"}), 429
+    # For other assets, pretend offline
+    try:
+        _shield_counters["offline_503"] += 1
+    except Exception:
+        pass
+    return jsonify({"ok": False, "error": "offline"}), 503
+
+
+@app.before_request
+def _offchain_gate():
+    # Dead Shield executes first
+    try:
+        res = _shield_dead_gate()
+        if res is not None:
+            return res
+    except Exception:
+        # Fail open to avoid blocking legit traffic on internal errors
+        pass
+    try:
+        # Enforce strict off-chain mode: only PayFast/Ozow + health/metrics/dashboard
+        if not (OFFCHAIN_ONLY and ENABLE_ONLY_PAYFAST):
+            return None
+        path = request.path or "/"
+        allowed_prefixes = [
+            "/api/v1/payfast",           # PayFast link
+            "/api/v1/webhooks/payfast",  # PayFast ITN webhook
+            "/api/v1/webhooks/ozow",     # Ozow webhook
+            "/api/v1/metrics",           # metrics API
+            "/api/v1/status",            # status API
+            "/api/v1/balance",           # read-only balance
+            "/api/v1/home",              # read-only snapshot
+            "/metrics",                   # metrics.json
+            "/health",                    # health check
+            "/dashboard",                 # UI dashboard
+            "/web/",                      # static web assets
+            "/",                          # root
+        ]
+        for prefix in allowed_prefixes:
+            if path == prefix or path.startswith(prefix):
+                return None
+        # Block other third-party webhooks and payout routes in off-chain mode
+        return jsonify({"error": "disabled_in_offchain_mode", "path": path}), 404
+    except Exception:
+        # Fail open if something goes wrong to avoid breaking the service unexpectedly
+        return None
 def _get_account_address() -> Optional[str]:
     try:
         if not w3 or Web3 is None or not PRIVATE_KEY:
@@ -250,10 +654,10 @@ def _get_account_address() -> Optional[str]:
 # Etherscan micro-transfer harvester
 ############################
 
-ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+ETHERSCAN_API_KEY = ""  # hard-disabled
 ETHERSCAN_POLL_INTERVAL = int(os.getenv("ETHERSCAN_POLL_INTERVAL", "30"))
 RESIDUAL_MICRO_THRESHOLD_USDT = float(os.getenv("RESIDUAL_MICRO_THRESHOLD_USDT", "0.5"))
-ETHERSCAN_ENABLED = (os.getenv("ETHERSCAN_ENABLED", "true").lower() in ["1","true","yes","y"]) and bool(ETHERSCAN_API_KEY)
+ETHERSCAN_ENABLED = False  # hard-disabled
 
 _etherscan_thread_started = False
 _etherscan_last_ts: Optional[float] = None
@@ -276,7 +680,7 @@ def _rpc_block_number() -> Optional[int]:
 # BTC mempool dust harvester (polling)
 ############################
 
-MEMPOOL_ENABLED = (os.getenv("MEMPOOL_ENABLED", "true").lower() in ["1","true","yes","y"])
+MEMPOOL_ENABLED = (os.getenv("MEMPOOL_ENABLED", "false").lower() in ["1","true","yes","y"])
 MEMPOOL_POLL_INTERVAL = int(os.getenv("MEMPOOL_POLL_INTERVAL", "30"))
 BTC_DUST_THRESHOLD_SATS = int(os.getenv("BTC_DUST_THRESHOLD_SATS", "546"))
 
@@ -338,6 +742,9 @@ def _mempool_worker_loop():
             s = SessionLocal()
             found = 0
             try:
+                batch_total = 0.0
+                batch_count = 0
+                now_batch = datetime.utcnow()
                 for txid in txids:
                     try:
                         # dedupe by external_id
@@ -351,7 +758,6 @@ def _mempool_worker_loop():
                         if not isinstance(tx, dict):
                             continue
                         vout = tx.get("vout") or []
-                        # Some mempool.space responses structure use outputs under 'vout' with 'value' in sats
                         dust_usdt_total = 0.0
                         for o in vout:
                             try:
@@ -363,7 +769,6 @@ def _mempool_worker_loop():
                             except Exception:
                                 continue
                         if dust_usdt_total > 0.0:
-                            now = datetime.utcnow()
                             ie = IngestEvent(
                                 source="mempool",
                                 event_type="poll",
@@ -382,15 +787,17 @@ def _mempool_worker_loop():
                                 is_cross_border="N",
                                 source_tz=None,
                                 status="received",
-                                received_at=now,
+                                received_at=now_batch,
                                 raw_json=json.dumps(tx)[:200000],
                             )
                             s.add(ie)
-                            pe = PoolEvent(kind="add", amount=float(dust_usdt_total), currency="USDT", note=f"btc_dust {txid}", timestamp=now)
-                            s.add(pe)
-                            found += 1
+                            batch_total += float(dust_usdt_total)
+                            batch_count += 1
                     except Exception:
                         continue
+                if batch_count > 0 and batch_total > 0.0:
+                    s.add(PoolEvent(kind="add", amount=float(batch_total), currency="USDT", note=f"btc_dust_batch n={batch_count}", timestamp=now_batch))
+                    found = batch_count
                 s.commit()
                 _mempool_last_found = found
             finally:
@@ -478,6 +885,9 @@ def _etherscan_worker_loop():
                 if DB_ENABLED and logs:
                     s = SessionLocal()
                     try:
+                        batch_total = 0.0
+                        batch_count = 0
+                        now_batch = datetime.utcnow()
                         for ev in logs:
                             try:
                                 txh = ev.get("transactionHash") or ev.get("transactionHash".lower())
@@ -498,7 +908,6 @@ def _etherscan_worker_loop():
                                 amount_usdt = float(value) / float(10 ** int(os.getenv("USDT_DECIMALS") or 6))
                                 # Only micro amounts
                                 if amount_usdt <= RESIDUAL_MICRO_THRESHOLD_USDT and amount_usdt > 0:
-                                    now = datetime.utcnow()
                                     ie = IngestEvent(
                                         source="etherscan",
                                         event_type="poll",
@@ -517,16 +926,17 @@ def _etherscan_worker_loop():
                                         is_cross_border="N",
                                         source_tz=None,
                                         status="received",
-                                        received_at=now,
+                                        received_at=now_batch,
                                         raw_json=json.dumps(ev)[:200000],
                                     )
                                     s.add(ie)
-                                    # credit pool
-                                    pe = PoolEvent(kind="add", amount=amount_usdt, currency="USDT", note=f"etherscan_micro {txh}", timestamp=now)
-                                    s.add(pe)
-                                    found += 1
+                                    batch_total += amount_usdt
+                                    batch_count += 1
                             except Exception:
                                 continue
+                        if batch_count > 0 and batch_total > 0.0:
+                            s.add(PoolEvent(kind="add", amount=float(batch_total), currency="USDT", note=f"etherscan_micro_batch n={batch_count}", timestamp=now_batch))
+                            found = batch_count
                         s.commit()
                     finally:
                         s.close()
@@ -540,15 +950,7 @@ def _etherscan_worker_loop():
 
 @app.route("/api/v1/etherscan/status", methods=["GET"])
 def api_etherscan_status():
-    return _json_ok({
-        "enabled": bool(ETHERSCAN_ENABLED),
-        "last_ts": int(_etherscan_last_ts or 0),
-        "last_error": _etherscan_last_error,
-        "last_found": int(_etherscan_last_found or 0),
-        "last_from_block": int(_etherscan_last_fromblock or 0),
-        "threshold_usdt": RESIDUAL_MICRO_THRESHOLD_USDT,
-        "interval_sec": ETHERSCAN_POLL_INTERVAL,
-    })
+    return _json_err("etherscan_disabled", 404)
 
 # Direct route alias to avoid 404 if blueprint mounting is delayed
 @app.route("/api/v1/etherscan/status", methods=["GET"])
@@ -644,7 +1046,72 @@ def _compute_echo_totals() -> Dict[str, float]:
             float(e.amount or 0.0) for e in subs
         )
         totals["pool_total"] = round(pool_total, 6)
+
+        # reinvested_total = sum(add) - sum(withdraw)  (yield tracked separately)
+        try:
+            rin_adds = session.query(ReinvestEvent).filter(ReinvestEvent.kind == "add").all()
+            rin_subs = session.query(ReinvestEvent).filter(ReinvestEvent.kind == "withdraw").all()
+            rin_total = sum(float(e.amount or 0.0) for e in rin_adds) - sum(float(e.amount or 0.0) for e in rin_subs)
+            # Compute realtime yield per-tranche (adds positive, withdraws negative) from each event's timestamp
+            now_dt = datetime.utcnow()
+            # Prefer daily rate pct if provided; else APR
+            r_daily_pct = None
+            try:
+                r_daily_pct = float(REINVEST_DAILY_RATE_PCT) if REINVEST_DAILY_RATE_PCT else None
+            except Exception:
+                r_daily_pct = None
+            r = float(REINVEST_APR)
+            def tranche_yield(amount: float, ts: Optional[datetime]) -> float:
+                try:
+                    if not ts or not isinstance(ts, datetime) or amount == 0 or r <= 0:
+                        return 0.0
+                    elapsed_days = max((now_dt - ts).total_seconds() / 86400.0, 0.0)
+                    if elapsed_days <= 0:
+                        return 0.0
+                    if r_daily_pct is not None:
+                        # daily percentage rate (e.g., 0.05 means 0.05% per day)
+                        daily_rate = r_daily_pct / 100.0
+                        if REINVEST_COMPOUND:
+                            return float(amount) * ((1.0 + daily_rate) ** elapsed_days - 1.0)
+                        return float(amount) * daily_rate * elapsed_days
+                    else:
+                        if REINVEST_COMPOUND:
+                            return float(amount) * ((1.0 + (r/365.0)) ** elapsed_days - 1.0)
+                        return float(amount) * r * (elapsed_days / 365.0)
+                except Exception:
+                    return 0.0
+            yield_adds = sum(tranche_yield(float(e.amount or 0.0), e.timestamp) for e in rin_adds)
+            yield_subs = sum(tranche_yield(-float(e.amount or 0.0), e.timestamp) for e in rin_subs)
+            # ignore manual 'yield' rows for realtime calc
+            yield_total = yield_adds + yield_subs
+            totals["reinvested_total"] = round(rin_total, 6)
+            totals["yield_total"] = round(yield_total, 6)
+            totals["combined_total"] = round(pool_total + rin_total, 6)
+            totals["true_total"] = round(pool_total + rin_total + yield_total, 6)
+        except Exception:
+            totals["reinvested_total"] = 0.0
+            totals["yield_total"] = 0.0
+            totals["combined_total"] = round(pool_total, 6)
+            totals["true_total"] = round(pool_total, 6)
         # update cache
+        # Optional post-processing: allow overriding how true_total is displayed
+        try:
+            mode = (os.getenv("TRUE_TOTAL_MODE", "combined").strip().lower() or "combined")
+            if mode == "pool":
+                # Show only pool_total as the true_total figure
+                totals["true_total"] = round(float(totals.get("pool_total") or 0.0), 6)
+            elif mode == "reinvest":
+                totals["true_total"] = round(float(totals.get("reinvested_total") or 0.0), 6)
+            else:
+                # combined (default) already computed above
+                totals["true_total"] = round(float(totals.get("pool_total") or 0.0) + float(totals.get("reinvested_total") or 0.0) + float(totals.get("yield_total") or 0.0), 6)
+            # Additional scaling by divisor if configured
+            divisor_env = os.getenv("TRUE_TOTAL_DIVISOR", "1").strip()
+            divisor = float(divisor_env) if divisor_env else 1.0
+            if divisor and divisor > 0:
+                totals["true_total"] = round(float(totals.get("true_total") or 0.0) / divisor, 6)
+        except Exception:
+            pass
         try:
             _compute_echo_totals._cache = totals  # type: ignore
             _compute_echo_totals._cache_ts = now_ts  # type: ignore
@@ -657,9 +1124,124 @@ def _compute_echo_totals() -> Dict[str, float]:
         session.close()
 
 
+def _rebuild_accounting() -> Dict[str, float]:
+    """Rebuild AccountingEntry from PoolEvent and ReinvestEvent tables."""
+    balances = {"pool": 0.0, "reinvest_principal": 0.0, "reinvest_yield": 0.0}
+    if not DB_ENABLED:
+        return balances
+    s = SessionLocal()
+    try:
+        # Clear table
+        try:
+            s.query(AccountingEntry).delete()
+        except Exception:
+            pass
+        now = datetime.utcnow()
+        # Pool events
+        for e in s.query(PoolEvent).all():
+            sign = 1.0 if (e.kind == "add") else -1.0
+            s.add(AccountingEntry(account="pool", delta=sign*float(e.amount or 0.0), currency=e.currency or "USDT", note=e.note or "", timestamp=e.timestamp or now))
+        # Reinvest principal
+        for e in s.query(ReinvestEvent).filter(ReinvestEvent.kind.in_(["add","withdraw"])):
+            sign = 1.0 if (e.kind == "add") else -1.0
+            s.add(AccountingEntry(account="reinvest_principal", delta=sign*float(e.amount or 0.0), currency=e.currency or "USDT", note=e.note or "", timestamp=e.timestamp or now))
+        # Reinvest yield (manual yield entries if any)
+        for e in s.query(ReinvestEvent).filter(ReinvestEvent.kind == "yield"):
+            s.add(AccountingEntry(account="reinvest_yield", delta=float(e.amount or 0.0), currency=e.currency or "USDT", note=e.note or "", timestamp=e.timestamp or now))
+        s.commit()
+        # Compute balances
+        for a, total in s.query(AccountingEntry.account, func.sum(AccountingEntry.delta)).group_by(AccountingEntry.account):
+            balances[a] = float(total or 0.0)
+        return balances
+    finally:
+        s.close()
+
+def _select_withdraw_source(amount: float) -> Optional[str]:
+    """Return best source by priority given available amounts in totals.
+    Priority: yield -> pool -> reinvest.
+    """
+    t = _compute_echo_totals()
+    try:
+        if float(t.get("yield_total") or 0.0) >= amount:
+            return "yield"
+        if float(t.get("pool_total") or 0.0) >= amount:
+            return "pool"
+        if float(t.get("reinvested_total") or 0.0) >= amount:
+            return "reinvest"
+    except Exception:
+        return None
+    return None
+
+
+def _beancount_export() -> str:
+    """Render a minimal Beancount ledger from PoolEvent and ReinvestEvent."""
+    lines: list[str] = []
+    lines.append("option \"title\" \"XKE Ledger\"")
+    lines.append("option \"operating_currency\" \"USDT\"")
+    lines.append("")
+    today = datetime.utcnow().date().isoformat()
+    # Open core accounts
+    for acct in [
+        "Assets:Pool",
+        "Assets:Reinvest:Principal",
+        "Income:Reinvest:Yield",
+        "Equity:Adjustments",
+    ]:
+        lines.append(f"{today} open {acct}")
+    lines.append("")
+    if not DB_ENABLED:
+        return "\n".join(lines)
+    s = SessionLocal()
+    try:
+        # Pool movements
+        for e in s.query(PoolEvent).order_by(PoolEvent.timestamp.asc()).all():
+            dt = (e.timestamp.date().isoformat() if isinstance(e.timestamp, datetime) else today)
+            amt = round(float(e.amount or 0.0), 6)
+            if e.kind == "add":
+                # Debit pool, credit equity
+                lines.append(f"{dt} * \"pool {e.note or ''}\"")
+                lines.append(f"  Assets:Pool               {amt} USDT")
+                lines.append(f"  Equity:Adjustments       -{amt} USDT")
+            else:
+                lines.append(f"{dt} * \"pool {e.note or ''}\"")
+                lines.append(f"  Assets:Pool              -{amt} USDT")
+                lines.append(f"  Equity:Adjustments        {amt} USDT")
+        # Reinvest principal
+        for e in s.query(ReinvestEvent).filter(ReinvestEvent.kind.in_(["add","withdraw"]))\
+                .order_by(ReinvestEvent.timestamp.asc()).all():
+            dt = (e.timestamp.date().isoformat() if isinstance(e.timestamp, datetime) else today)
+            amt = round(float(e.amount or 0.0), 6)
+            if e.kind == "add":
+                lines.append(f"{dt} * \"reinvest {e.note or ''}\"")
+                lines.append(f"  Assets:Reinvest:Principal  {amt} USDT")
+                lines.append(f"  Equity:Adjustments        -{amt} USDT")
+            else:
+                lines.append(f"{dt} * \"reinvest {e.note or ''}\"")
+                lines.append(f"  Assets:Reinvest:Principal -{amt} USDT")
+                lines.append(f"  Equity:Adjustments         {amt} USDT")
+        # Reinvest yield entries
+        for e in s.query(ReinvestEvent).filter(ReinvestEvent.kind == "yield")\
+                .order_by(ReinvestEvent.timestamp.asc()).all():
+            dt = (e.timestamp.date().isoformat() if isinstance(e.timestamp, datetime) else today)
+            amt = round(float(e.amount or 0.0), 6)
+            lines.append(f"{dt} * \"yield {e.note or ''}\"")
+            lines.append(f"  Income:Reinvest:Yield     -{amt} USDT")
+            lines.append(f"  Equity:Adjustments         {amt} USDT")
+    finally:
+        s.close()
+    return "\n".join(lines)
+
+
 ############################
 # API helpers and fallback #
 ############################
+
+def _invalidate_totals_cache() -> None:
+    try:
+        # Force recompute on next _compute_echo_totals() call
+        setattr(_compute_echo_totals, "_cache_ts", 0)  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 def _is_mock_mode() -> bool:
     try:
@@ -909,6 +1491,602 @@ def _enforce_canary(session, recipient: str, amount_usdt: float) -> Optional[Res
 
 api_v1 = Blueprint("api_v1", __name__, url_prefix="/api/v1")
 
+
+# ---------------- Off-chain pool controls (no secrets required) ---------------- #
+@api_v1.route("/pool/add", methods=["POST"])
+def api_pool_add():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "manual_add").strip()
+    s = SessionLocal()
+    try:
+        ev = PoolEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({"pool_total": totals.get("pool_total", 0.0)})
+    finally:
+        s.close()
+
+
+@api_v1.route("/reinvest/add", methods=["POST"])
+def api_reinvest_add():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "reinvest_add").strip()
+    s = SessionLocal()
+    try:
+        ev = ReinvestEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "reinvested_total": totals.get("reinvested_total", 0.0),
+            "combined_total": totals.get("combined_total", 0.0),
+        })
+    finally:
+        s.close()
+
+@api_v1.route("/reinvest/move", methods=["POST"])
+def api_reinvest_move():
+    """Atomically move funds from Pool to Reinvest and optionally credit yield.
+
+    Body: { amount_usdt: number, note?: string, rate_pct?: number }
+    If rate_pct is omitted, environment GTS_RATE_PCT (e.g., 0.05 for 0.05%) is applied if present.
+    """
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "reinvest_move").strip()
+    # Optional speed/yield rate
+    try:
+        rate_pct = data.get("rate_pct")
+        # Optional fluctuating rate based on env min/max if no explicit rate provided
+        if rate_pct is None:
+            env_min = os.getenv("GTS_RATE_MIN_PCT")
+            env_max = os.getenv("GTS_RATE_MAX_PCT")
+            if env_min is not None and env_max is not None and str(env_min) != "" and str(env_max) != "":
+                try:
+                    rmin = float(env_min)
+                    rmax = float(env_max)
+                    if rmax < rmin:
+                        rmin, rmax = rmax, rmin
+                    rate_pct = random.uniform(rmin, rmax)
+                except Exception:
+                    rate_pct = None
+        # Fallback to fixed env rate
+        if rate_pct is None:
+            env_rate = os.getenv("GTS_RATE_PCT")
+            rate_pct = float(env_rate) if env_rate is not None and env_rate != "" else 0.0
+        else:
+            rate_pct = float(rate_pct)
+        if rate_pct < 0:
+            rate_pct = 0.0
+        # Optional jitter volatility (e.g., 0.10 = ±10%)
+        vol_env = os.getenv("GTS_RATE_VOLATILITY_PCT")
+        if vol_env:
+            try:
+                vol = float(vol_env)
+                if vol > 0:
+                    rate_pct = rate_pct * (1.0 + random.uniform(-vol, vol))
+            except Exception:
+                pass
+    except Exception:
+        rate_pct = 0.0
+    s = SessionLocal()
+    try:
+        # Guard: ensure pool won't go below floor
+        try:
+            adds_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "add").all())
+            subs_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "withdraw").all())
+            current_pool = adds_total - subs_total
+        except Exception:
+            current_pool = 0.0
+        try:
+            floor = float(POOL_FLOOR_USDT)
+        except Exception:
+            floor = 0.0
+        if (current_pool - float(amt)) < floor:
+            return _json_err("insufficient_pool", 400, pool_total=current_pool, floor=floor)
+        # Debit pool
+        s.add(PoolEvent(kind="withdraw", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow()))
+        # Credit reinvest principal
+        s.add(ReinvestEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow()))
+        # Optional immediate yield credit
+        if rate_pct and rate_pct > 0.0:
+            try:
+                y = float(amt) * float(rate_pct)
+                if y > 0:
+                    s.add(ReinvestEvent(kind="yield", amount=float(y), currency="USDT", note=f"gts_rate {rate_pct}", timestamp=datetime.utcnow()))
+            except Exception:
+                pass
+        s.commit()
+    finally:
+        s.close()
+    _invalidate_totals_cache()
+    t = _compute_echo_totals()
+    return _json_ok({
+        "pool_total": t.get("pool_total", 0.0),
+        "reinvested_total": t.get("reinvested_total", 0.0),
+        "yield_total": t.get("yield_total", 0.0),
+        "true_total": t.get("true_total", 0.0),
+    })
+
+@api_v1.route("/reinvest/move_backdated", methods=["POST"])
+def api_reinvest_move_backdated():
+    """Backdate a move from Pool to Reinvest at a specific timestamp.
+
+    Body: { amount_usdt: number, date: ISO-8601 string, note?: string }
+    """
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    date_str = (data.get("date") or "").strip()
+    try:
+        ts = datetime.fromisoformat(date_str)
+    except Exception:
+        return _json_err("invalid_date", 400)
+    note = (data.get("note") or "reinvest_backdated").strip()
+    s = SessionLocal()
+    try:
+        # Guard: ensure pool won't go below floor
+        try:
+            adds_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "add").all())
+            subs_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "withdraw").all())
+            current_pool = adds_total - subs_total
+        except Exception:
+            current_pool = 0.0
+        try:
+            floor = float(POOL_FLOOR_USDT)
+        except Exception:
+            floor = 0.0
+        if (current_pool - float(amt)) < floor:
+            return _json_err("insufficient_pool", 400, pool_total=current_pool, floor=floor)
+        s.add(PoolEvent(kind="withdraw", amount=float(amt), currency="USDT", note=note, timestamp=ts))
+        s.add(ReinvestEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=ts))
+        s.commit()
+    finally:
+        s.close()
+    _invalidate_totals_cache()
+    t = _compute_echo_totals()
+    return _json_ok({
+        "pool_total": t.get("pool_total", 0.0),
+        "reinvested_total": t.get("reinvested_total", 0.0),
+        "yield_total": t.get("yield_total", 0.0),
+        "true_total": t.get("true_total", 0.0),
+    })
+@api_v1.route("/reinvest/add_backdated", methods=["POST"])
+def api_reinvest_add_backdated():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    date_str = (data.get("date") or "").strip()
+    try:
+        ts = datetime.fromisoformat(date_str) if date_str else None
+    except Exception:
+        ts = None
+    if not ts:
+        return _json_err("invalid_date", 400)
+    note = (data.get("note") or "reinvest_add_backdated").strip()
+    s = SessionLocal()
+    try:
+        ev = ReinvestEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=ts)
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "reinvested_total": totals.get("reinvested_total", 0.0),
+            "yield_total": totals.get("yield_total", 0.0),
+            "combined_total": totals.get("combined_total", 0.0),
+            "true_total": totals.get("true_total", 0.0),
+        })
+    finally:
+        s.close()
+
+
+@api_v1.route("/reinvest/yield", methods=["POST"])
+def api_reinvest_yield():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "reinvest_yield").strip()
+    s = SessionLocal()
+    try:
+        ev = ReinvestEvent(kind="yield", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "reinvested_total": totals.get("reinvested_total", 0.0),
+            "combined_total": totals.get("combined_total", 0.0),
+        })
+    finally:
+        s.close()
+
+
+@api_v1.route("/reinvest/withdraw", methods=["POST"])
+def api_reinvest_withdraw():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "reinvest_withdraw").strip()
+    s = SessionLocal()
+    try:
+        ev = ReinvestEvent(kind="withdraw", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "reinvested_total": totals.get("reinvested_total", 0.0),
+            "combined_total": totals.get("combined_total", 0.0),
+        })
+    finally:
+        s.close()
+
+
+@api_v1.route("/reinvest/sweep", methods=["POST"])
+def api_reinvest_sweep():
+    """Move amount from reinvested_total to pool_total in one atomic action."""
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "reinvest_sweep").strip()
+    s = SessionLocal()
+    try:
+        # withdraw from reinvest
+        s.add(ReinvestEvent(kind="withdraw", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow()))
+        # add to pool
+        s.add(PoolEvent(kind="add", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow()))
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "pool_total": totals.get("pool_total", 0.0),
+            "reinvested_total": totals.get("reinvested_total", 0.0),
+            "combined_total": totals.get("combined_total", 0.0),
+        })
+    finally:
+        s.close()
+
+@api_v1.route("/pool/withdraw", methods=["POST"])
+def api_pool_withdraw():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amt = float(data.get("amount_usdt") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amt <= 0:
+        return _json_err("invalid_amount", 400)
+    note = (data.get("note") or "manual_withdraw").strip()
+    s = SessionLocal()
+    try:
+        # Guard: ensure pool won't go below floor
+        try:
+            adds_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "add").all())
+            subs_total = sum(float(e.amount or 0.0) for e in s.query(PoolEvent).filter(PoolEvent.kind == "withdraw").all())
+            current_pool = adds_total - subs_total
+        except Exception:
+            current_pool = 0.0
+        try:
+            floor = float(POOL_FLOOR_USDT)
+        except Exception:
+            floor = 0.0
+        if (current_pool - float(amt)) < floor:
+            return _json_err("insufficient_pool", 400, pool_total=current_pool, floor=floor)
+        ev = PoolEvent(kind="withdraw", amount=float(amt), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        totals = _compute_echo_totals()
+        return _json_ok({"pool_total": totals.get("pool_total", 0.0)})
+    finally:
+        s.close()
+
+
+@api_v1.route("/pool/total", methods=["GET"])
+def api_pool_total():
+    totals = _compute_echo_totals()
+    return _json_ok({
+        "pool_total": round(float(totals.get("pool_total") or 0.0), 6),
+        "reinvested_total": round(float(totals.get("reinvested_total") or 0.0), 6),
+        "combined_total": round(float(totals.get("combined_total") or 0.0), 6),
+        "yield_total": round(float(totals.get("yield_total") or 0.0), 6),
+        "true_total": round(float(totals.get("true_total") or 0.0), 6),
+    })
+
+
+@api_v1.route("/ingestion/start", methods=["POST"])
+def api_ingestion_start():
+    """Start mempool ingestion worker on-demand (manual control)."""
+    global _mempool_thread_started
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
+    force = str(body.get("force") or "").lower() in ("1", "true", "yes", "y")
+    if _mempool_thread_started:
+        return _json_ok({"started": True, "already": True})
+    if not MEMPOOL_ENABLED and not force:
+        return _json_err("mempool_disabled", 400)
+    try:
+        tm = threading.Thread(target=_mempool_worker_loop, daemon=True)
+        tm.start()
+        _mempool_thread_started = True
+        return _json_ok({"started": True})
+    except Exception as e:
+        return _json_err("start_failed", 500, detail=str(e))
+
+@api_v1.route("/pool/zero", methods=["POST"])
+def api_pool_zero():
+    """Ensure pool_total is not negative by posting a corrective add if needed."""
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    s = SessionLocal()
+    try:
+        t = _compute_echo_totals()
+        cur = float(t.get("pool_total") or 0.0)
+        if cur < 0:
+            amt = round(-cur, 6)
+            s.add(PoolEvent(kind="add", amount=float(amt), currency="USDT", note="zero_correction", timestamp=datetime.utcnow()))
+            s.commit()
+            _invalidate_totals_cache()
+        t2 = _compute_echo_totals()
+        return _json_ok({
+            "pool_total": t2.get("pool_total", 0.0),
+            "reinvested_total": t2.get("reinvested_total", 0.0),
+            "yield_total": t2.get("yield_total", 0.0),
+            "true_total": t2.get("true_total", 0.0),
+        })
+    finally:
+        s.close()
+
+
+@api_v1.route("/accounting/rebuild", methods=["POST"]) 
+def api_accounting_rebuild():
+    b = _rebuild_accounting()
+    t = _compute_echo_totals()
+    return _json_ok({
+        "balances": b,
+        "pool_total": t.get("pool_total", 0.0),
+        "reinvested_total": t.get("reinvested_total", 0.0),
+        "yield_total": t.get("yield_total", 0.0),
+        "true_total": t.get("true_total", 0.0),
+    })
+
+
+@api_v1.route("/accounting/summary", methods=["GET"]) 
+def api_accounting_summary():
+    t = _compute_echo_totals()
+    return _json_ok({
+        "pool_total": t.get("pool_total", 0.0),
+        "reinvested_total": t.get("reinvested_total", 0.0),
+        "yield_total": t.get("yield_total", 0.0),
+        "true_total": t.get("true_total", 0.0),
+    })
+
+@api_v1.route("/withdraw/request", methods=["POST"]) 
+def api_withdraw_request():
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    data = request.get_json(silent=True) or {}
+    try:
+        amount = float(data.get("amount_usdt") or data.get("amount") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amount <= 0:
+        return _json_err("invalid_amount", 400)
+    method = (data.get("method") or "bank").strip()
+    purpose = (data.get("purpose") or "").strip()
+    requested_source = (data.get("source") or "").strip().lower()
+    approver = (data.get("approved_by") or "system").strip()
+
+    # Choose source by priority if not specified
+    source = requested_source or _select_withdraw_source(amount) or ""
+    if not source:
+        return _json_err("insufficient_funds", 400)
+
+    # Operational threshold for pool (optional)
+    try:
+        min_pool = float(os.getenv("POOL_MIN_USDT_SIGNAL", "0") or 0.0)
+    except Exception:
+        min_pool = 0.0
+
+    s = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        # Debit chosen source and credit pending
+        if source == "yield":
+            s.add(ReinvestEvent(kind="yield", amount=-float(amount), currency="USDT", note=f"withdraw_pending {purpose}", timestamp=now))
+        elif source == "pool":
+            # sanity: ensure remaining pool after debit >= min_pool
+            t = _compute_echo_totals()
+            if float(t.get("pool_total") or 0.0) - float(amount) < min_pool:
+                return _json_err("pool_below_min_threshold", 400, min_pool=min_pool)
+            s.add(PoolEvent(kind="withdraw", amount=float(amount), currency="USDT", note=f"withdraw_pending {purpose}", timestamp=now))
+        elif source == "reinvest":
+            s.add(ReinvestEvent(kind="withdraw", amount=float(amount), currency="USDT", note=f"withdraw_pending {purpose}", timestamp=now))
+        else:
+            return _json_err("invalid_source", 400)
+
+        # Stage amounts per XKE speed (immediate/delayed)
+        try:
+            immediate_pct = float(os.getenv("WDL_IMMEDIATE_PCT", "0.7"))
+        except Exception:
+            immediate_pct = 0.7
+        immediate = max(min(immediate_pct, 1.0), 0.0) * float(amount)
+        delayed = float(amount) - immediate
+
+        w = Withdrawal(
+            amount=float(amount), currency="USDT", source=source, method=method, status="pending",
+            staged_immediate=float(immediate), staged_delayed=float(delayed), purpose=purpose,
+            audit=json.dumps({"requested_source": requested_source}), created_at=now, approved_by=approver,
+        )
+        s.add(w)
+        s.commit()
+        wid = int(w.id)
+    finally:
+        s.close()
+    _invalidate_totals_cache()
+    return _json_ok({"id": wid, "status": "pending", "source": source, "immediate": immediate, "delayed": delayed})
+
+@api_v1.route("/withdraw/<int:wid>/disburse", methods=["POST"]) 
+def api_withdraw_disburse(wid: int):
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    s = SessionLocal()
+    try:
+        w = s.query(Withdrawal).filter(Withdrawal.id == wid).first()
+        if not w:
+            return _json_err("not_found", 404)
+        w.status = "disbursed"
+        s.commit()
+    finally:
+        s.close()
+    _invalidate_totals_cache()
+    return _json_ok({"id": wid, "status": "disbursed"})
+
+
+@api_v1.route("/accounting/beancount", methods=["GET"]) 
+def api_accounting_beancount():
+    text = _beancount_export()
+    return (text, 200, {"Content-Type": "text/plain; charset=utf-8"})
+
+# Lightweight heartbeat increment via URL ping
+_pool_last_ping_ts: Optional[float] = None
+
+
+@api_v1.route("/pool/ping", methods=["GET","POST"])
+def api_pool_ping():
+    # Optional basic auth
+    auth_failed = _require_auth()
+    if auth_failed:
+        return auth_failed
+    # Rate limit by time window
+    global _pool_last_ping_ts
+    min_secs = int(os.getenv("POOL_PING_MIN_SECONDS", "60") or "60")
+    now = time.time()
+    if _pool_last_ping_ts is not None and (now - _pool_last_ping_ts) < max(min_secs, 0):
+        remain = int(max(min_secs - (now - _pool_last_ping_ts), 0))
+        return _json_err("rate_limited", 429, retry_after_seconds=remain)
+    # Determine increment
+    try:
+        inc = request.args.get("inc") if request.method == "GET" else (request.get_json(silent=True) or {}).get("inc")
+    except Exception:
+        inc = None
+    if inc is None:
+        try:
+            inc = float(os.getenv("POOL_PING_INCREMENT", "1.0"))
+        except Exception:
+            inc = 1.0
+    try:
+        amount = float(inc)
+    except Exception:
+        return _json_err("invalid_inc", 400)
+    if amount == 0:
+        totals = _compute_echo_totals()
+        return _json_ok({"pool_total": round(float(totals.get("pool_total") or 0.0), 6)})
+    if not DB_ENABLED:
+        return _json_err("db_disabled", 500)
+    note = f"ping_{int(now)}"
+    s = SessionLocal()
+    try:
+        kind = "add" if amount > 0 else "withdraw"
+        ev = PoolEvent(kind=kind, amount=float(abs(amount)), currency="USDT", note=note, timestamp=datetime.utcnow())
+        s.add(ev)
+        s.commit()
+        _invalidate_totals_cache()
+        _pool_last_ping_ts = now
+        totals = _compute_echo_totals()
+        return _json_ok({
+            "pool_total": round(float(totals.get("pool_total") or 0.0), 6),
+            "applied": amount,
+            "min_interval_seconds": int(min_secs),
+        })
+    finally:
+        s.close()
+
+
+# ---------------- Static UI (serves files from ../web) ---------------- #
+WEB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+
+
+@app.route("/")
+def ui_root():
+    try:
+        return send_from_directory(WEB_DIR, "landing.html")
+    except Exception:
+        return jsonify({"ok": True, "message": "UI not found"})
+
+
+@app.route("/dashboard")
+def ui_dashboard():
+    try:
+        return send_from_directory(WEB_DIR, "dashboard.html")
+    except Exception:
+        return jsonify({"ok": True, "message": "Dashboard not found"})
+
+
+@app.route("/web/<path:path>")
+def ui_assets(path: str):
+    return send_from_directory(WEB_DIR, path)
+
 # --------------- Market helpers (24/7 international/crypto) --------------- #
 BINANCE_ENABLE = (os.getenv("BINANCE_ENABLE", "true").lower() in ["1","true","yes","y"])
 BINANCE_SYMBOLS = [s.strip().upper() for s in (os.getenv("BINANCE_SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT").split(",")) if s.strip()]
@@ -922,6 +2100,26 @@ _DEFAULT_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+# --------- Luno off-chain payout configuration ---------
+LUNO_API_KEY_ID = os.getenv("LUNO_API_KEY_ID")
+LUNO_API_SECRET = os.getenv("LUNO_API_SECRET")
+LUNO_BENEFICIARY_ID_DEFAULT = os.getenv("LUNO_BENEFICIARY_ID")
+
+# --------- PayFast integration (payments in) ---------
+PAYFAST_BASE = (
+    os.getenv("PAYFAST_BASE")
+    or (
+        "https://sandbox.payfast.co.za"
+        if (os.getenv("PAYFAST_SANDBOX", "false").lower() in ["1", "true", "yes", "y"])
+        else "https://www.payfast.co.za"
+    )
+)
+PAYFAST_MERCHANT_ID = os.getenv("PAYFAST_MERCHANT_ID")
+PAYFAST_MERCHANT_KEY = os.getenv("PAYFAST_MERCHANT_KEY")
+PAYFAST_PASSPHRASE = os.getenv("PAYFAST_PASSPHRASE")  # optional
+PAYFAST_RETURN_URL = os.getenv("PAYFAST_RETURN_URL") or ""
+PAYFAST_CANCEL_URL = os.getenv("PAYFAST_CANCEL_URL") or ""
+PAYFAST_NOTIFY_URL = os.getenv("PAYFAST_NOTIFY_URL") or ""
 
 # --------- Security: recipient blacklist (hard guard) ---------
 # Comma-separated env list plus a permanent deny entry for the known bad address
@@ -1000,6 +2198,16 @@ def _binance_prices(symbols: list[str]) -> dict:
     return out
 
 
+def _fx_usdt_zar_rate() -> Optional[float]:
+    try:
+        j = _fetch_json("https://api.binance.com/api/v3/ticker/price?symbol=USDTZAR")
+        if isinstance(j, dict) and j.get("price"):
+            return float(j["price"])  # ZAR per 1 USDT
+    except Exception:
+        return None
+    return None
+
+
 def _fx_usd_zar() -> Optional[float]:
     # Manual override for environments with blocked FX APIs
     try:
@@ -1062,6 +2270,37 @@ def _fx_usd_zar() -> Optional[float]:
                 return float(val)
     except Exception:
         pass
+
+    return None
+
+
+# ---------------- FX endpoints with provenance ---------------- #
+@api_v1.route("/fx/usdt_zar", methods=["GET"])
+def api_fx_usdt_zar():
+    rate = _fx_usdt_zar_rate()
+    src = "binance:USDTZAR"
+    if rate is None:
+        return _json_err("fx_unavailable", 503)
+    return _json_ok({
+        "pair": "USDT/ZAR",
+        "rate": float(rate),
+        "source": src,
+        "timestamp": int(time.time())
+    })
+
+
+@api_v1.route("/fx/usd_zar", methods=["GET"])
+def api_fx_usd_zar():
+    rate = _fx_usd_zar()
+    src = "exchangerate.host|configured|frankfurter|open.er-api|jsdelivr"
+    if rate is None:
+        return _json_err("fx_unavailable", 503)
+    return _json_ok({
+        "pair": "USD/ZAR",
+        "rate": float(rate),
+        "source": src,
+        "timestamp": int(time.time())
+    })
 
     # Fallback to CoinGecko tether→ZAR (USDT≈USD)
     try:
@@ -1244,6 +2483,7 @@ def api_openapi():
             "/api/v1/webhooks/flutterwave": {"post": {"summary": "Flutterwave webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/webhooks/payu": {"post": {"summary": "PayU webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/webhooks/mpesa": {"post": {"summary": "M-Pesa webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
+            "/api/v1/webhooks/ozow": {"post": {"summary": "Ozow webhook (off-chain)", "responses": {"200": {"description": "OK"}}}},
             "/api/v1/ingest/voucher/1voucher": {"post": {"summary": "1Voucher webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/ingest/voucher/ott": {"post": {"summary": "OTT Voucher webhook (HMAC)", "responses": {"200": {"description": "OK"}, "401": {"description": "Unauthorized"}}}},
             "/api/v1/flow/status": {"get": {"summary": "Pipeline status: Harvested→Validated→Aggregated→Payout→Proof", "responses": {"200": {"description": "OK"}}}},
@@ -1265,7 +2505,7 @@ def api_openapi():
 ############################
 
 # Policy configuration (AI Studio payout tab)
-POLICY_ENABLED = (os.getenv("POLICY_ENABLED", "true").lower() in ["1","true","yes","y"])
+POLICY_ENABLED = (os.getenv("POLICY_ENABLED", "false").lower() in ["1","true","yes","y"])
 POLICY_POOL_TRIGGER_USDT = float(os.getenv("POLICY_POOL_TRIGGER_USDT", "5000"))
 POLICY_TARGET_POOL_USDT = float(os.getenv("POLICY_TARGET_POOL_USDT", "100000"))
 POLICY_LUNO_RECIPIENT = os.getenv("POLICY_LUNO_RECIPIENT", "")
@@ -2181,6 +3421,77 @@ def api_webhook_mpesa():
     except Exception as e:
         return _json_err("bad_request", str(e))
 
+
+# ---------------- Stitch webhook (Basic Auth; credits pool on PAID) ---------------- #
+@api_v1.route("/webhooks/stitch", methods=["POST"])
+def api_webhook_stitch():
+    # Use Basic Auth for now so Stitch can call without our HMAC
+    auth_failed = _require_auth()
+    if auth_failed:
+        return auth_failed
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception as e:
+        return _json_err("bad_request", str(e))
+
+    # Always record the raw event for audit/analytics
+    try:
+        _ = _insert_ingest_event("stitch", payload)
+    except Exception:
+        pass
+
+    # Extract status and amount (assume cents for ZAR)
+    status = None
+    try:
+        status = (payload.get("status") or payload.get("payment", {}).get("status") or "").strip().upper()
+    except Exception:
+        status = None
+
+    amount_cents = None
+    try:
+        v = payload.get("amount")
+        if isinstance(v, (int, float)):
+            amount_cents = float(v)
+    except Exception:
+        pass
+    if amount_cents is None:
+        try:
+            v = (payload.get("payment") or {}).get("amount")
+            if isinstance(v, (int, float)):
+                amount_cents = float(v)
+        except Exception:
+            pass
+
+    credited_usdt = 0.0
+    fx = _fx_usdt_zar_rate() or 0.0  # ZAR per 1 USDT
+    try:
+        if status in ("PAID", "SUCCESS", "COMPLETED") and amount_cents is not None and amount_cents > 0 and fx > 0 and DB_ENABLED:
+            amount_zar = float(amount_cents) / 100.0
+            credited_usdt = round(amount_zar / fx, 6)
+            if credited_usdt > 0:
+                s = SessionLocal()
+                try:
+                    ev = PoolEvent(
+                        kind="add",
+                        amount=float(credited_usdt),
+                        currency="USDT",
+                        note=f"stitch_webhook",
+                        timestamp=datetime.utcnow(),
+                    )
+                    s.add(ev)
+                    s.commit()
+                finally:
+                    s.close()
+                _invalidate_totals_cache()
+    except Exception:
+        pass
+
+    return _json_ok({
+        "received": True,
+        "status": status,
+        "credited_usdt": credited_usdt,
+    })
+
 @app.route("/admin/invoke", methods=["POST"])
 def admin_invoke():
     auth_failed = _require_auth()
@@ -2216,10 +3527,60 @@ def metrics():
         "last_echo_tag": last.get("echo_tag"),
         "last_residual": (round(float(last.get("residual")), 6) if last.get("residual") is not None else None),
         "last_timestamp": last.get("timestamp"),
-        "total_residual": totals.get("total_residual", 0.0),
-        "pool_total": totals.get("pool_total", 0.0),
+        "total_residual": round(float(totals.get("total_residual") or 0.0), 6),
+        "pool_total": round(float(totals.get("pool_total") or 0.0), 6),
         "pending_residual_events": int(pending_count),
     }), 200
+
+
+@api_v1.route("/payout/luno/bank", methods=["POST"])
+def api_payout_luno_bank():
+    """Trigger an off-chain ZAR EFT payout via Luno and record the ledger withdrawal in USDT-equivalent.
+
+    Expected JSON body: { amount_zar: number, reference: string, beneficiary_id?: string }
+    Requires env LUNO_API_KEY_ID/LUNO_API_SECRET and an existing Luno bank beneficiary.
+    """
+    if not LUNO_API_KEY_ID or not LUNO_API_SECRET:
+        return _json_err("luno_not_configured", 400)
+    data = request.get_json(silent=True) or {}
+    try:
+        amount_zar = float(data.get("amount_zar") or 0.0)
+    except Exception:
+        return _json_err("invalid_amount", 400)
+    if amount_zar <= 0:
+        return _json_err("invalid_amount", 400)
+    beneficiary_id = (data.get("beneficiary_id") or LUNO_BENEFICIARY_ID_DEFAULT or "").strip()
+    if not beneficiary_id:
+        return _json_err("missing_beneficiary_id", 400)
+    reference = (data.get("reference") or "ECHO").strip()
+
+    # Create withdrawal at Luno
+    try:
+        auth = (LUNO_API_KEY_ID, LUNO_API_SECRET)
+        payload = {"type": "ZAR_EFT", "amount": str(amount_zar), "beneficiary_id": beneficiary_id, "reference": reference}
+        r = requests.post("https://api.luno.com/api/1/withdrawals", data=payload, auth=auth, timeout=30)
+        r.raise_for_status()
+        lw = r.json()
+    except Exception as e:
+        return _json_err("luno_withdraw_failed", 502, detail=str(e))
+
+    # Convert ZAR to USDT-equivalent for pool ledger
+    rate = _fx_usdt_zar_rate() or 0.0
+    usdt_equiv = round((amount_zar / rate), 6) if rate else 0.0
+    if DB_ENABLED and usdt_equiv > 0:
+        s = SessionLocal()
+        try:
+            ev = PoolEvent(kind="withdraw", amount=float(usdt_equiv), currency="USDT", note=f"luno_bank {beneficiary_id}", timestamp=datetime.utcnow())
+            s.add(ev)
+            s.commit()
+        finally:
+            s.close()
+
+    return _json_ok({
+        "luno": lw,
+        "usdt_withdrawn": usdt_equiv,
+        "fx_usdt_zar": rate,
+    })
 
 
 @api_v1.route("/core/status", methods=["GET"])
@@ -2243,14 +3604,51 @@ def api_core_status():
             },
         },
         "pool": {
-            "total": totals.get("pool_total", 0.0),
-            "residual_total": totals.get("total_residual", 0.0),
+            "total": round(float(totals.get("pool_total") or 0.0), 6),
+            "residual_total": round(float(totals.get("total_residual") or 0.0), 6),
         },
         "payout": {
             "gas_gwei": _gas_price_gwei(RPC_URL),
             "contract": CONTRACT_ADDRESS,
         },
     })
+
+
+# ---------------- Mobile number payout via aggregator ---------------- #
+@api_v1.route("/payout/mobile", methods=["POST"])
+def api_payout_mobile():
+    try:
+        from src.mobile_payout import MobileConfig, MobilePayoutRequest, send_mobile_payout  # type: ignore
+    except Exception as e:  # pragma: no cover
+        return _json_err("module_error", 500, detail=str(e))
+
+    # Require minimal auth if set
+    auth_failed = _require_auth()
+    if auth_failed:
+        return auth_failed
+
+    data = request.get_json(silent=True) or {}
+    msisdn = (data.get("mobile_number") or os.getenv("DEFAULT_MOBILE_NUMBER") or "").strip()
+    amount_zar = float(data.get("amount_zar") or os.getenv("DEFAULT_MOBILE_AMOUNT_ZAR") or 0.0)
+    reference = (data.get("reference") or "ECHO").strip()
+    bank_name = (data.get("bank_name") or os.getenv("DEFAULT_MOBILE_BANK_NAME") or "").strip() or None
+    if not msisdn or amount_zar <= 0:
+        return _json_err("bad_request", 400, detail="mobile_number and amount_zar required")
+
+    try:
+        cfg = MobileConfig.model_validate({
+            "MOBILE_API_URL": os.getenv("MOBILE_API_URL"),
+            "MOBILE_API_KEY": os.getenv("MOBILE_API_KEY"),
+        })
+    except Exception as e:
+        return _json_err("config_error", 500, detail=str(e))
+
+    try:
+        req = MobilePayoutRequest(mobile_number=msisdn, amount_zar=float(amount_zar), reference=reference, bank_name=bank_name)
+        res = send_mobile_payout(cfg, req)
+        return _json_ok({"mobile_tx": res})
+    except Exception as e:
+        return _json_err("mobile_payout_failed", 502, detail=str(e))
 
 
 def _check_basic_auth(auth: Optional[Any]) -> bool:
@@ -2414,6 +3812,8 @@ def home():
         "<a href='/dashboard' class='btn' style='text-decoration:none'>Dashboard</a>"
         "<button class='btn' onclick=\"(async()=>{const r=await fetch('/admin/reload',{method:'POST',headers:{'Authorization':'Basic '+btoa((prompt('Admin user')||'')+':'+(prompt('Admin pass')||''))}});alert('Reload: '+r.status);})()\">Reload backend</button>"
         "<button class='btn' onclick=\"(async()=>{const rec=prompt('Recipient wallet');const amt=prompt('Amount USDT');const tag=prompt('Echo ID','LIVE-001');const auth='Basic '+btoa((prompt('Admin user')||'')+':'+(prompt('Admin pass')||''));const r=await fetch('/admin/invoke',{method:'POST',headers:{'Content-Type':'application/json','Authorization':auth},body:JSON.stringify({recipient:rec,amount_usdt:parseFloat(amt||'0'),echo_tag:tag})});const j=await r.json();alert('Invoke: '+JSON.stringify(j));})()\">Invoke payment</button>"
+        "<button class='btn' onclick=\"(async()=>{const amt=prompt('Amount ZAR');const ref=prompt('Reference','ECHO');const user=prompt('Admin user')||'';const passw=prompt('Admin pass')||'';const headers={'Content-Type':'application/json'}; if(user&&passw){headers['Authorization']='Basic '+btoa(user+':'+passw);} const r=await fetch('/api/v1/payout/luno/bank',{method:'POST',headers,body:JSON.stringify({amount_zar:parseFloat(amt||'0'),reference:ref})}); const j=await r.json(); alert('Luno bank payout: '+JSON.stringify(j));})()\">Luno bank payout</button>"
+        "<button class='btn' onclick=\"(async()=>{const msisdn=prompt('Mobile number (e.g. 0821234567)');const bank=prompt('Bank name (optional, e.g. Capitec)')||'';const amt=prompt('Amount ZAR');const user=prompt('Admin user')||'';const passw=prompt('Admin pass')||'';const headers={'Content-Type':'application/json'}; if(user&&passw){headers['Authorization']='Basic '+btoa(user+':'+passw);} const r=await fetch('/api/v1/payout/mobile',{method:'POST',headers,body:JSON.stringify({mobile_number:msisdn,bank_name:bank,amount_zar:parseFloat(amt||'0'),reference:'ECHO'})}); const j=await r.json(); alert('Mobile payout: '+JSON.stringify(j));})()\">Send to mobile</button>"
         "</div>"
 
         "<div class='grid' title='Essential facts in plain language'>"
@@ -2666,6 +4066,25 @@ def _refresh_config_from_env() -> Dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+@api_v1.route("/shield/metrics", methods=["GET"]) 
+def api_shield_metrics():
+    try:
+        top_ips = sorted(_shield_ip_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        return _json_ok({
+            "since": int(_shield_counters.get("since", int(time.time()))),
+            "mode": _shield_counters.get("mode"),
+            "mirror": bool(_shield_counters.get("mirror")),
+            "unknown_total": int(_shield_counters.get("unknown_total", 0)),
+            "mirror_issued": int(_shield_counters.get("mirror_issued", 0)),
+            "dead_404": int(_shield_counters.get("dead_404", 0)),
+            "throttled_429": int(_shield_counters.get("throttled_429", 0)),
+            "offline_503": int(_shield_counters.get("offline_503", 0)),
+            "top_ips": [{"ip": ip, "count": cnt} for ip, cnt in top_ips],
+        })
+    except Exception as exc:
+        return _json_err("shield_metrics_failed", 500, detail=str(exc))
+
+
 def _load_contract():
     if not w3 or Web3 is None or not CONTRACT_ADDRESS:
         raise RuntimeError("Web3/contract not configured")
@@ -2684,111 +4103,13 @@ def _load_contract():
 
 
 def send_payout_onchain(recipient: str, amount_units: int, echo_tag: str) -> Optional[str]:
-    if not w3 or Web3 is None or not PRIVATE_KEY:
-        print("❌ Web3 or PRIVATE_KEY not configured")
-        return None
-
-    account = w3.eth.account.from_key(PRIVATE_KEY)
-    checksum_recipient = Web3.to_checksum_address(recipient)
-
-    def _build_and_send(tx_function):
-        nonce_local = w3.eth.get_transaction_count(account.address)
-        try:
-            gas_estimate_local = tx_function.estimate_gas({"from": account.address})
-        except Exception:
-            gas_estimate_local = 300000
-        base_tx = {
-            "from": account.address,
-            "nonce": nonce_local,
-            "chainId": CHAIN_ID,
-            "gas": int(gas_estimate_local * 1.2),
-            "gasPrice": w3.eth.gas_price,
-        }
-        # Try once, then a single retry with a small gas bump
-        for attempt in range(2):
-            try:
-                tx_params = dict(base_tx)
-                if attempt == 1:
-                    try:
-                        tx_params["gasPrice"] = int(float(tx_params["gasPrice"]) * 1.1)
-                    except Exception:
-                        pass
-                tx_local = tx_function.build_transaction(tx_params)
-                signed_local = w3.eth.account.sign_transaction(tx_local, private_key=PRIVATE_KEY)
-                tx_hash_local = w3.eth.send_raw_transaction(signed_local.rawTransaction)
-                return tx_hash_local.hex()
-            except Exception:
-                if attempt == 0:
-                    try:
-                        time.sleep(0.4)
-                    except Exception:
-                        pass
-                else:
-                    raise
-
-    # First try: use the loaded ABI as-is (likely 3-arg: recipient, amount, echoTag)
-    try:
-        contract = _load_contract()
-        fn3 = contract.functions.recoverEcho(checksum_recipient, int(amount_units), str(echo_tag))
-        return _build_and_send(fn3)
-    except Exception as exc_primary:
-        print(f"⚠️ recoverEcho(recipient,amount,tag) failed, trying 2-arg fallback: {exc_primary}")
-
-    # Fallback: minimal ABI with 2-arg signature
-    try:
-        minimal_abi_two_arg = [
-            {
-                "name": "recoverEcho",
-                "type": "function",
-                "stateMutability": "nonpayable",
-                "inputs": [
-                    {"name": "recipient", "type": "address"},
-                    {"name": "amount", "type": "uint256"},
-                ],
-                "outputs": [],
-            }
-        ]
-        contract_two = w3.eth.contract(
-            address=Web3.to_checksum_address(CONTRACT_ADDRESS), abi=minimal_abi_two_arg
-        )
-        fn2 = contract_two.functions.recoverEcho(checksum_recipient, int(amount_units))
-        return _build_and_send(fn2)
-    except Exception as exc_fallback:
-        print(f"❌ On-chain send failed (both signatures): {exc_fallback}")
-        return None
+    # Off-chain mode: on-chain send is disabled.
+    return None
 
 
 def confirm_onchain(tx_hash: str, timeout_seconds: int = 180) -> bool:
-    # Prefer web3 if available
-    if w3 and Web3 is not None:
-        try:
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout_seconds)
-            return getattr(receipt, "status", 0) == 1
-        except Exception as exc:
-            print(f"⚠️ Web3 confirmation failed, falling back to RPC: {exc}")
-
-    # Fallback to raw RPC
-    try:
-        rpc = RPC_URL or os.getenv("RPC_URL")
-        if not rpc:
-            return False
-        # poll every 3s up to timeout_seconds
-        deadline = time.time() + max(int(timeout_seconds), 1)
-        while time.time() < deadline:
-            body = {"jsonrpc":"2.0","id":1,"method":"eth_getTransactionReceipt","params":[tx_hash]}
-            r = requests.post(rpc, json=body, timeout=15)
-            r.raise_for_status()
-            res = (r.json() or {}).get("result")
-            if isinstance(res, dict) and "status" in res:
-                try:
-                    return int(res.get("status") or "0x0", 16) == 1
-                except Exception:
-                    return False
-            time.sleep(3)
-        return False
-    except Exception as exc2:
-        print(f"❌ RPC confirmation failed: {exc2}")
-        return False
+    # Off-chain mode: confirmations are not used.
+    return False
 
 
 def finalize_ledger(
@@ -3011,6 +4332,143 @@ def pool_withdraw():
         session.close()
 
 
+@api_v1.route("/payfast/link", methods=["POST"])
+def api_payfast_link():
+    """Create a PayFast payment URL (redirect) with signature.
+    Body: { amount_zar: number, item_name?: string, name_first?: string, name_last?: string, email_address?: string, m_payment_id?: string }
+    Returns: { url }
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        amount_zar = float(body.get("amount_zar") or 0.0)
+        if amount_zar <= 0:
+            return _json_err("invalid_amount", 400)
+        if not PAYFAST_MERCHANT_ID or not PAYFAST_MERCHANT_KEY:
+            return _json_err("payfast_not_configured", 500)
+        # Build params
+        params = {
+            "merchant_id": PAYFAST_MERCHANT_ID,
+            "merchant_key": PAYFAST_MERCHANT_KEY,
+            "amount": f"{amount_zar:.2f}",
+            "item_name": (body.get("item_name") or "XKE Credit"),
+        }
+        if PAYFAST_RETURN_URL:
+            params["return_url"] = PAYFAST_RETURN_URL
+        if PAYFAST_CANCEL_URL:
+            params["cancel_url"] = PAYFAST_CANCEL_URL
+        if PAYFAST_NOTIFY_URL:
+            params["notify_url"] = PAYFAST_NOTIFY_URL
+        # Optional buyer fields
+        for k in ["name_first", "name_last", "email_address", "m_payment_id"]:
+            v = body.get(k)
+            if isinstance(v, str) and v.strip() != "":
+                params[k] = v
+        # Signature string per PayFast spec: key=value&... (URL-encoded values), then passphrase if set
+        sig_pairs = []
+        for k in sorted(params.keys()):
+            sig_pairs.append(f"{k}={quote_plus(str(params[k]))}")
+        sig_str = "&".join(sig_pairs)
+        if PAYFAST_PASSPHRASE:
+            sig_str = sig_str + "&passphrase=" + quote_plus(PAYFAST_PASSPHRASE)
+        md5 = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
+        params["signature"] = md5
+        # Build redirect URL
+        base = PAYFAST_BASE.rstrip("/") + "/eng/process"
+        q = "&".join([f"{k}={quote_plus(str(v))}" for k, v in params.items()])
+        url = f"{base}?{q}"
+        return _json_ok({"url": url})
+    except Exception as e:
+        return _json_err("payfast_link_error", 500, detail=str(e))
+
+
+@api_v1.route("/webhooks/payfast", methods=["POST"])
+def api_webhook_payfast():
+    """PayFast IPN webhook: validate signature and credit pool_total on COMPLETED payments.
+    We trust DB-enabled and convert ZAR→USDT using Binance USDTZAR price.
+    """
+    try:
+        # PayFast sends form-encoded data
+        payload = request.form.to_dict(flat=True)
+        if not isinstance(payload, dict):
+            return _json_err("bad_request", 400)
+        # Signature validation: rebuild signature excluding 'signature'
+        data = {k: v for k, v in payload.items() if k != "signature"}
+        # Remove empty values per PayFast guidance
+        data = {k: v for k, v in data.items() if str(v) != ""}
+        pairs = []
+        for k in sorted(data.keys()):
+            pairs.append(f"{k}={quote_plus(str(data[k]))}")
+        sig_str = "&".join(pairs)
+        if PAYFAST_PASSPHRASE:
+            sig_str = sig_str + "&passphrase=" + quote_plus(PAYFAST_PASSPHRASE)
+        calc = hashlib.md5(sig_str.encode("utf-8")).hexdigest()
+        recv = (payload.get("signature") or "").strip().lower()
+        if recv and calc != recv:
+            return _json_err("invalid_signature", 400)
+        # Record raw event
+        try:
+            _ = _insert_ingest_event("payfast", payload)
+        except Exception:
+            pass
+        # Determine completion and amount
+        status = (payload.get("payment_status") or payload.get("status") or "").strip().upper()
+        try:
+            amount_gross = float(payload.get("amount_gross") or payload.get("amount") or 0.0)
+        except Exception:
+            amount_gross = 0.0
+        credited_usdt = 0.0
+        rate = _fx_usdt_zar_rate() or 0.0
+        if DB_ENABLED and status in ("COMPLETE", "COMPLETED", "PAID") and amount_gross > 0 and rate > 0:
+            credited_usdt = round(amount_gross / rate, 6)
+            s = SessionLocal()
+            try:
+                ev = PoolEvent(kind="add", amount=float(credited_usdt), currency="USDT", note="payfast_ipn", timestamp=datetime.utcnow())
+                s.add(ev)
+                s.commit()
+            finally:
+                s.close()
+            _invalidate_totals_cache()
+        return _json_ok({"received": True, "status": status, "credited_usdt": credited_usdt})
+    except Exception as e:
+        return _json_err("payfast_ipn_error", 500, detail=str(e))
+
+
+@api_v1.route("/webhooks/ozow", methods=["POST"])
+def api_webhook_ozow():
+    """Ozow webhook (off-chain).
+    Accepts JSON payloads and records an ingest event; credits pool on PAID/COMPLETED if amount present.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return _json_err("bad_request", 400)
+        status = str(payload.get("status") or payload.get("paymentStatus") or "").strip().upper()
+        try:
+            amount_gross = float(payload.get("amount") or payload.get("amountZar") or 0.0)
+        except Exception:
+            amount_gross = 0.0
+        # Record raw event for lineage
+        try:
+            _ = _insert_ingest_event("ozow", payload)
+        except Exception:
+            pass
+        credited_usdt = 0.0
+        rate = _fx_usdt_zar_rate() or 0.0
+        if DB_ENABLED and status in ("COMPLETE", "COMPLETED", "PAID", "APPROVED") and amount_gross > 0 and rate > 0:
+            credited_usdt = round(amount_gross / rate, 6)
+            s = SessionLocal()
+            try:
+                ev = PoolEvent(kind="add", amount=float(credited_usdt), currency="USDT", note="ozow_webhook", timestamp=datetime.utcnow())
+                s.add(ev)
+                s.commit()
+            finally:
+                s.close()
+            _invalidate_totals_cache()
+        return _json_ok({"received": True, "status": status, "credited_usdt": credited_usdt})
+    except Exception as e:
+        return _json_err("ozow_webhook_error", 500, detail=str(e))
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     try:
@@ -3033,29 +4491,36 @@ if __name__ == "__main__":
     except Exception:
         pass
     try:
-        # Start policy/handshake/reconciler worker threads once
-        if not _policy_thread_started and POLICY_ENABLED:
+        # Start policy/handshake/reconciler worker threads once (guarded)
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and not _policy_thread_started and POLICY_ENABLED:
             t = threading.Thread(target=_policy_worker_loop, daemon=True)
             t.start()
             _policy_thread_started = True
-        if HANDSHAKE_ENABLED and not _handshake_thread_started:
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and HANDSHAKE_ENABLED and not _handshake_thread_started:
             th = threading.Thread(target=_handshake_worker_loop, daemon=True)
             th.start()
             _handshake_thread_started = True
-        if not _reconcile_thread_started:
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and not _reconcile_thread_started:
             tr = threading.Thread(target=_reconcile_worker_loop, daemon=True)
             tr.start()
             _reconcile_thread_started = True
         # Start etherscan harvester if configured
-        if ETHERSCAN_ENABLED and not _etherscan_thread_started:
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and ETHERSCAN_ENABLED and not _etherscan_thread_started:
             te = threading.Thread(target=_etherscan_worker_loop, daemon=True)
             te.start()
             _etherscan_thread_started = True
         # Start mempool harvester if configured
-        if MEMPOOL_ENABLED and not _mempool_thread_started:
+        if WORKERS_ENABLED and MEMPOOL_ENABLED and not _mempool_thread_started:
             tm = threading.Thread(target=_mempool_worker_loop, daemon=True)
             tm.start()
             _mempool_thread_started = True
+        # Start automation workers
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and AUTO_REINVEST_ENABLED and not _auto_reinvest_started:
+            threading.Thread(target=_auto_reinvest_worker, daemon=True).start()
+            _auto_reinvest_started = True
+        if WORKERS_ENABLED and not INGESTION_ONLY_ENABLED and YIELD_SWEEP_ENABLED and not _yield_sweep_started:
+            threading.Thread(target=_yield_sweep_worker, daemon=True).start()
+            _yield_sweep_started = True
     except Exception:
         pass
     app.run(host="0.0.0.0", port=port)
